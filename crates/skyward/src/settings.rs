@@ -14,6 +14,9 @@ use std::path::Path;
 const METADATA: &str = "/metadata";
 const FOLDER: &str = "/metadata/skyward";
 const FILE: &str = "/metadata/skyward/settings.json";
+/// What the owner enters at their screen lock, kept for the recovery to open
+/// their files by itself once they have said it may.
+const CREDENTIAL: &str = "/metadata/skyward/credential";
 /// What a write goes into first, to be moved over the file whole.
 const WRITING: &str = "/metadata/skyward/settings.json.new";
 
@@ -75,4 +78,52 @@ fn with_metadata<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     let done = work();
     mount::umount(at)?;
     done
+}
+
+/// What the owner enters at their screen lock, kept so the recovery opens
+/// their files by itself, or nothing where it is not kept.
+pub fn credential() -> Option<Vec<u8>> {
+    let kept = with_metadata(|| match fs::read(CREDENTIAL) {
+        Ok(bytes) => Ok(Some(bytes).filter(|b: &Vec<u8>| !b.is_empty())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {CREDENTIAL}")),
+    });
+    match kept {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("the kept credential was not read: {e:#}"));
+            None
+        }
+    }
+}
+
+/// Keep `credential` for the starts after this one.
+pub fn keep_credential(credential: &[u8]) -> Result<()> {
+    with_metadata(|| {
+        skyward_vab::metadata_writable(true)?;
+        let wrote = (|| -> Result<()> {
+            fs::create_dir_all(FOLDER).with_context(|| format!("make {FOLDER}"))?;
+            let mut file = File::create(CREDENTIAL).with_context(|| format!("make {CREDENTIAL}"))?;
+            file.write_all(credential).with_context(|| format!("write {CREDENTIAL}"))?;
+            file.sync_all().with_context(|| format!("write {CREDENTIAL}"))
+        })();
+        let back = skyward_vab::metadata_writable(false);
+        wrote?;
+        back
+    })
+}
+
+/// Keep no credential any more.
+pub fn forget_credential() -> Result<()> {
+    with_metadata(|| {
+        skyward_vab::metadata_writable(true)?;
+        let gone = match fs::remove_file(CREDENTIAL) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove {CREDENTIAL}")),
+        };
+        let back = skyward_vab::metadata_writable(false);
+        gone?;
+        back
+    })
 }

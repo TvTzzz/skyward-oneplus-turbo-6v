@@ -496,6 +496,15 @@ pub mod kms {
         /// fastest, which it switches to after, where that is another.
         preferred: property::Value<'static>,
         fastest: Option<property::Value<'static>>,
+        /// The rate the preferred mode runs at, to tell whether a rate
+        /// chosen is the one the panel comes up in.
+        preferred_hz: u32,
+        /// The modes the panel offers at its own size, from the slowest.
+        rate_modes: Vec<drm::control::Mode>,
+        /// The rates those modes run at, from the slowest.
+        rates: Vec<u32>,
+        /// The rate the panel is kept at; 0 for its fastest.
+        chosen: u32,
         /// The sub-pixel rendering setup the CRTC takes with each mode,
         /// where the panel leaves its sub-pixel rendering to the display.
         spr: Option<(property::Handle, property::Value<'static>)>,
@@ -543,6 +552,12 @@ pub mod kms {
                 .rev()
                 .max_by_key(|m| m.vrefresh())
                 .expect("the preferred mode itself has the preferred size");
+            let mut rate_modes: Vec<drm::control::Mode> =
+                conn.modes().iter().copied().filter(|m| m.size() == preferred.size()).collect();
+            rate_modes.sort_by_key(|m| m.vrefresh());
+            rate_modes.dedup_by_key(|m| m.vrefresh());
+            let rates: Vec<u32> = rate_modes.iter().map(|m| m.vrefresh()).collect();
+            let preferred_hz = preferred.vrefresh();
             let (w, h) = (mode.size().0 as u32, mode.size().1 as u32);
 
             // The CRTC already driving the panel, or the first one an
@@ -739,6 +754,10 @@ pub mod kms {
                 mode_id,
                 preferred: first,
                 fastest,
+                preferred_hz,
+                rate_modes,
+                rates,
+                chosen: 0,
                 spr,
                 conn,
                 lp,
@@ -755,6 +774,47 @@ pub mod kms {
 
         pub fn describe(&self) -> &str {
             &self.summary
+        }
+
+        /// The refresh rates the panel offers at its own size, from the
+        /// slowest.
+        pub fn rates(&self) -> &[u32] {
+            &self.rates
+        }
+
+        /// The rate the panel is kept at; 0 for its fastest.
+        pub fn refresh(&self) -> u32 {
+            self.chosen
+        }
+
+        /// Keep the panel at `hz`, 0 for the fastest rate it offers. A lit
+        /// panel switches at once; one that is off comes on in that rate.
+        pub fn set_refresh(&mut self, hz: u32) -> Result<()> {
+            let mode = match hz {
+                0 => *self.rate_modes.last().context("the panel offers no refresh rate")?,
+                _ => *self
+                    .rate_modes
+                    .iter()
+                    .find(|m| m.vrefresh() == hz)
+                    .with_context(|| format!("the panel offers no {hz} Hz"))?,
+            };
+            self.chosen = hz;
+            let blob = if mode.vrefresh() == self.preferred_hz {
+                None
+            } else {
+                Some(self.card.create_property_blob(&mode).context("create mode blob")?)
+            };
+            self.fastest = blob;
+            if self.power == Power::On {
+                self.settle()?;
+                let mut req = atomic::AtomicModeReq::new();
+                req.add_property(self.crtc, self.mode_id, self.fastest.unwrap_or(self.preferred));
+                if let Some((id, setup)) = self.spr {
+                    req.add_property(self.crtc, id, setup);
+                }
+                commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET).context("switch the panel's refresh rate")?;
+            }
+            Ok(())
         }
 
         pub fn is_on(&self) -> bool {

@@ -55,6 +55,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// How long init may take to hand the USB port to another function: the
 /// program behind the new one has to start and get ready first.
 const USB_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the port may take to come up as fastboot. fastbootd is started
+/// from init once the port is asked for, and only says the port is ready
+/// after it has opened its function; on a phone whose recovery starts slowly
+/// that is past the five seconds every other switch takes, and the port does
+/// come up, so the wait is longer here than the failure it would report.
+const FASTBOOT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the page shows that the work the system asked for is done
 /// before the phone starts the system or powers off.
@@ -67,7 +73,13 @@ const TOUCH_WAIT: Duration = Duration::from_secs(5);
 /// How long a panel gone dark rests, ready to light again at once, before
 /// the display turns off; the phone's own system keeps its panel dozing
 /// about as long after the screen goes off.
-const REST: Duration = Duration::from_secs(5);
+///
+/// The OnePlus Turbo 6V never rests that long: its display driver does not
+/// bring the panel back from being turned off, and the recovery stayed
+/// dark when the power key asked for it again, so the panel is left dozing
+/// for as long as the screen is off. Dozing is what the phone's own system
+/// keeps its panel in after the screen goes off, and it lights at once.
+const REST: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where logs saved to the temporary folder go, in the recovery service's
 /// own folder, and where in internal storage the others do.
@@ -136,11 +148,15 @@ impl Backlight {
 /// 14 and the K80 series and one of the K90's give it only as the level
 /// their factory tests drive the panel to, on the backlight's own scale:
 /// the 13 Ultra's panels give that level as well, and it comes to the same
-/// half of their range as the normal maximum they give.
-const NORMAL_MAX: [(&str, &str); 3] = [
+/// half of their range as the normal maximum they give. The panels of the
+/// phones of other makers give it under their own names: the OnePlus Turbo
+/// 6V gives the normal maximum on the backlight's own scale, as
+/// `qcom,mdss-dsi-bl-max-level` does for the whole range.
+const NORMAL_MAX: [(&str, &str); 4] = [
     ("mi,normal-max-brightness-clone", "mi,max-brightness-clone"),
     ("mi,max-brightness-normal", "qcom,mdss-dsi-bl-max-level"),
     ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
+    ("oplus,dsi-brightness-normal-max-level", "qcom,mdss-dsi-bl-max-level"),
 ];
 
 /// The raw backlight level, out of `max`, at the panel's normal maximum.
@@ -834,7 +850,7 @@ fn log_mounted(mounted: &Opened) -> Result<()> {
 /// that lock is answered with, or nothing. Users whose credential the phone
 /// made up open behind the owner and are never asked; one that did not
 /// open goes to the kernel log with why.
-fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
+fn show_closed(app: &mut App, closed: &[Closed]) -> Result<Option<(u32, Keys)>> {
     use skyward_crypto::user::Lock;
     skyward_sys::kmsg(&format!("the users whose own files are still closed: {:?}", closed.iter().map(|c| c.user).collect::<Vec<_>>()))?;
     for c in closed {
@@ -851,7 +867,7 @@ fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
         (c.user, keys)
     });
     app.data_waiting(waiting);
-    Ok(())
+    Ok(waiting)
 }
 
 /// What the file manager lists for a folder: its entries, folders and
@@ -1045,13 +1061,77 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
 
 /// Run the pages. What `request`, read from misc, asks for decides the
 /// first of them; asking for nothing, they start at `start`.
-pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+/// Draw the panel at once, before the slot's partitions are mounted and the
+/// phone's own programs started: that takes seconds, and the panel would
+/// otherwise stay dark for them, as the boot loader's splash is gone by then.
+/// What is drawn stays until the pages' first frame.
+pub fn splash(font: &Path, mono: &Path) -> Result<KmsSurface> {
+    let fonts = Fonts::load(font, 0, mono)?;
+    let mut surface = KmsSurface::open("/dev/dri/card0")?;
+    // The panel comes up at whatever the boot loader left it at, which is
+    // dimmer than the pages are ever shown: it is lit at the brightness the
+    // settings keep, so the first frame is seen as the pages are.
+    let kept = crate::settings::read().ok();
+    let settings = kept.as_ref().and_then(|k| k.settings());
+    let brightness = settings.map(|s| s.brightness).unwrap_or(0.7);
+    // The pages' own theme, so the first frame is not a black screen the
+    // pages replace.
+    let dark = settings.is_some_and(|s| s.dark);
+    if let Ok(mut backlight) = Backlight::open() {
+        if let Err(e) = backlight.show(Some(brightness)) {
+            skyward_sys::kmsg(&format!("the panel was not lit for the first frame: {e:#}"))?;
+        }
+    }
+    let (w, h) = surface.size();
+    let (bg, ink, hint) = match dark {
+        true => (skyward_ui::Rgba::rgb(0x0e, 0x10, 0x14), skyward_ui::Rgba::rgb(0xf2, 0xf3, 0xf5), skyward_ui::Rgba::rgb(0x8a, 0x90, 0x98)),
+        false => (skyward_ui::Rgba::rgb(0xf7, 0xf7, 0xfa), skyward_ui::Rgba::rgb(0x14, 0x14, 0x18), skyward_ui::Rgba::rgb(0x7a, 0x7a, 0x84)),
+    };
+    let mut c = Canvas::filled(w, h, bg);
+    let px = (w as f32 * 0.13).round();
+    let x = (w as f32 * 0.08).round();
+    let base = (h as f32 * 0.46).round();
+    c.text(&fonts.title, "Skyward", x, base, px, ink, Some(w as f32 - x * 2.0));
+    let small = (w as f32 * 0.036).round();
+    c.text(&fonts.body, "正在启动…", x, base + px * 1.15, small, hint, Some(w as f32 - x * 2.0));
+    surface.present(&c)?;
+    surface.settle()?;
+    skyward_sys::kmsg(&format!("the panel shows the first frame, {w}x{h}, backlit at {brightness:.2}"))?;
+    Ok(surface)
+}
+
+pub fn run(
+    cfg: &DeviceConfig,
+    font: &Path,
+    mono: &Path,
+    request: bcb::Request,
+    start: Screen,
+    dump: Option<&Path>,
+    taken: Option<KmsSurface>,
+) -> Result<()> {
+    // A program the recovery was asked to run on the bare display, before
+    // it takes the display for its own pages: it runs to its end and the
+    // pages come back after it, the port never leaving init's hands. The
+    // property is cleared first, so a program that takes the recovery down
+    // with it does not run again at the next start.
+    if let Some(script) = skyward_sys::prop("persist.skyward.run") {
+        skyward_sys::set_prop("persist.skyward.run", "")?;
+        skyward_sys::kmsg(&format!("running {script} on the bare display"))?;
+        let ended = std::process::Command::new("/system/bin/sh").arg(&script).status();
+        skyward_sys::kmsg(&format!("{script} ended: {ended:?}"))?;
+    }
     if cfg.display.density == 0 {
         return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
     }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let mut surface = KmsSurface::open("/dev/dri/card0")?;
+    // A panel given a first frame before the partitions were mounted keeps
+    // it: the display is taken over rather than opened again, which would
+    // blank it for the moment that takes.
+    let mut surface = match taken {
+        Some(surface) => surface,
+        None => KmsSurface::open("/dev/dri/card0")?,
+    };
     let (w, h) = surface.size();
     eprintln!("display {}", surface.describe());
     let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
@@ -1078,6 +1158,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         | Work::SystemStopped => start,
     };
     let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
+    app.state.refresh_rates = surface.rates().to_vec();
     app.set_screen_corners(cfg.display.corner_radius as f32);
     // The settings kept from the starts before are back before the first
     // frame, and before file transfer starts with its switch and the time
@@ -1088,6 +1169,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
     app.take_settings(kept.settings(), named);
+    // The rate kept from an earlier start takes the panel before the first
+    // frame; one the panel no longer offers is left to the fastest.
+    if app.state.refresh != surface.refresh() {
+        if let Err(e) = surface.set_refresh(app.state.refresh) {
+            skyward_sys::kmsg(&format!("the panel kept its fastest refresh: {e:#}"))?;
+            app.state.refresh = surface.refresh();
+        }
+    }
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
@@ -1104,6 +1193,24 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Opening the data partition, or a user's own files in it, under way,
     // and the users whose own files are still closed once it is open.
     let mut decryptor: Option<Decryptor> = None;
+    // Where the owner said the recovery may open their files by itself, the
+    // partition is opened as the pages come up, not when a page is tapped.
+    if app.state.auto_decrypt && settings::credential().is_some() {
+        let _ = app.open_by_itself();
+        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+    }
+    // What the owner entered at their screen lock, kept until the unlock it
+    // was entered for ends, to be kept for the starts after it where the
+    // settings say the recovery opens their files by itself.
+    let mut entered: Option<Vec<u8>> = None;
+    // Whether the unlock under way is one the recovery began by itself, so a
+    // credential it kept that no longer opens the files is forgotten rather
+    // than tried at every start.
+    let mut by_itself = false;
+    // The user and the kind of lock their screen asks for, kept so the
+    // settings page can ask for the credential once more, to be sure it
+    // opens their files before it is kept.
+    let mut lock_seen: Option<(u32, Keys)> = None;
     let mut closed: Vec<Closed> = Vec::new();
     let mut arriving = Some(Incoming::Arrived);
     // The mount page shows the partitions as they are when it opens and
@@ -1130,6 +1237,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // page says whether it came up and how far a computer has the port;
     // why it did not come up goes to the kernel log and on screen.
     let mut fastboot = first == Screen::Fastboot;
+    // Handing the port back and mounting the partitions again as the
+    // fastboot page leaves, on a thread of its own: the page says it is
+    // going on rather than standing still for the seconds it takes.
+    let mut entering: Option<std::sync::mpsc::Receiver<Result<()>>> = None;
     let mut port_at = Instant::now();
     // File transfer runs while its switch is on, and offers internal
     // storage while that is open; one that does not start says why on
@@ -1147,10 +1258,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // A sideload has the port, which goes back to rest once it ends.
     let mut sideloading = false;
     if fastboot {
-        if let Err(e) = skyward_sys::usb::switch("fastboot", USB_TIMEOUT) {
-            skyward_sys::kmsg(&format!("fastbootd has not taken the port: {e:#}"))?;
-            app.report(&format!("{e:#}"), monotonic_ms());
-        }
+        // The port is handed over on a thread of its own: init starts
+        // fastbootd once it is asked for, and fastbootd says the port is
+        // ready only after it has opened its function, which on a phone
+        // whose recovery starts slowly is seconds after the first frame.
+        // Waiting here would hold the page back behind a dark panel; the
+        // page says how far the hand-over is as it goes.
+        std::thread::spawn(|| {
+            if let Err(e) = skyward_sys::usb::switch("fastboot", FASTBOOT_TIMEOUT) {
+                let _ = skyward_sys::kmsg(&format!("fastbootd has not taken the port: {e:#}"));
+            }
+        });
         let (running, link) = fastboot_status()?;
         app.set_fastboot(running, link);
     }
@@ -1309,6 +1427,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     if transfer.is_some() && !fastboot && !sideloading {
         if let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
             skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
+            // The port took file transfer off adb's and never bound the
+            // two, which leaves nothing on it at all: a phone whose init
+            // knows no rule for the pair, as one from another maker may.
+            // adb alone is what the port came up with, so it goes back to
+            // that, and the recovery stays reachable.
+            skyward_sys::usb::set_mtp(false);
+            match skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
+                Ok(()) => skyward_sys::kmsg("the port is back to adb alone")?,
+                Err(e) => skyward_sys::kmsg(&format!("the port did not take adb alone either: {e:#}"))?,
+            }
             app.report(&format!("{e:#}"), monotonic_ms());
         }
     }
@@ -1355,6 +1483,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         None => None,
     };
     let mut scanned_at = Instant::now();
+    // Whether a kept network has been joined by itself this session.
+    let mut auto_joined = false;
     app.state.update_server = cfg.update.is_some();
     // Asking the update server, and downloading the full package.
     let mut checker: Option<updates::Worker> = None;
@@ -1402,6 +1532,41 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 other => unreachable!("time passing asks for nothing but the motor, not {other:?}"),
             }
         }
+        // The hand-over the fastboot page asked for, once it ends.
+        let mut handed = None;
+        if let Some(told) = &entering {
+            if let Ok(done) = told.try_recv() {
+                handed = Some(done);
+            }
+        }
+        if let Some(done) = handed {
+            entering = None;
+            app.entered();
+            match done {
+                Ok(()) => {
+                    read_at = Instant::now();
+                    info = skyward_info::collect(cfg)?;
+                    fastboot = false;
+                    app.enter_recovery();
+                    // The partitions are up, and with them whatever the
+                    // motor's driver reads its waveform from: a driver that
+                    // read it before they were keeps its failure until it
+                    // is told to read it again.
+                    if let Some(h) = &mut haptics {
+                        if let Err(e) = h.reload() {
+                            skyward_sys::kmsg(&format!("the motor's waveform was not loaded again: {e:#}"))?;
+                        }
+                    }
+                    if let Some(w) = systems_worker.as_mut() {
+                        w.send(systems::Task::Resume);
+                    }
+                }
+                Err(e) => app.report(&format!("{e:#}"), monotonic_ms()),
+            }
+        }
+        // Every time of day the pages write follows the setting, which the
+        // page may have just turned.
+        skyward_ui::fmt::set_hours12(app.state.hours12);
         let time = clock(app.state.time_zone)?;
         if time != shown_clock {
             shown_clock = time;
@@ -1438,6 +1603,26 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             let (running, link) = fastboot_status()?;
             app.set_fastboot(running, link);
             port_at = Instant::now();
+        }
+        // A rate chosen on the settings page takes the panel at once.
+        // Whether the charge is weighed before installing is the settings'
+        // to say.
+        skyward_install::skip_battery_check(app.state.no_battery_check);
+        if app.state.refresh != surface.refresh() {
+            let wanted = app.state.refresh;
+            match surface.set_refresh(wanted) {
+                Ok(()) => {
+                    let what = match wanted {
+                        0 => "its fastest".to_string(),
+                        hz => format!("{hz} Hz"),
+                    };
+                    skyward_sys::kmsg(&format!("the panel refreshes at {what}"))?;
+                }
+                Err(e) => {
+                    skyward_sys::kmsg(&format!("the panel kept its refresh rate: {e:#}"))?;
+                    app.state.refresh = surface.refresh();
+                }
+            }
         }
         let panel = app.panel(now);
         let mut shown = false;
@@ -1907,10 +2092,35 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         if let Some((told, traffic)) = wlan.as_ref().map(wlan::Worker::told) {
             if let Some(w) = told {
+                // A kept password the access point refused is forgotten, so
+                // the page asks for it rather than trying it again.
+                if let Some(joined) = &w.joined {
+                    if matches!(joined.stage, Joining::WrongPassword) {
+                        app.forget_wlan(&joined.name);
+                    }
+                }
                 app.set_wlan(w);
             }
             if let Some(t) = traffic {
                 app.set_traffic(t);
+            }
+        }
+        // A network joined before is joined again as the WLAN comes up and
+        // its scan finds it, without a page asking for its password.
+        if !auto_joined && app.state.auto_wlan {
+            let found = app.state.wlan.as_ref().and_then(|w| {
+                let on = w.power == WlanPower::On;
+                let free = w.joined.is_none();
+                let saved = w.networks.iter().find(|n| app.saved_wlan(&n.name).is_some())?.name.clone();
+                (on && free).then_some(saved)
+            });
+            if let Some(name) = found {
+                auto_joined = true;
+                if let Some(w) = app.saved_wlan(&name).cloned() {
+                    let ssid = name.clone().into_bytes();
+                    skyward_sys::kmsg(&format!("joining the kept WLAN {name}"))?;
+                    wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security: w.security, password: w.password });
+                }
             }
         }
         // The WLAN page scans again now and then while it shows, as the
@@ -2034,7 +2244,20 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         log_mounted(mounted)?;
                     }
                     closed = opening.closed;
-                    show_closed(&mut app, &closed)?;
+                    if let Some(seen) = show_closed(&mut app, &closed)? {
+                        lock_seen = Some(seen);
+                    }
+                    // Opened by itself where the owner said it may, with the
+                    // credential the recovery kept.
+                    if !closed.is_empty() && app.state.auto_decrypt {
+                        if let Some(credential) = settings::credential() {
+                            if let Some(user) = closed.iter().find(|c| !c.made_up).map(|c| c.user) {
+                                let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential };
+                                decryptor = Some(Decryptor::start(job)?);
+                                by_itself = true;
+                            }
+                        }
+                    }
                 }
                 decrypt::Ended::Opened(Err(why)) => {
                     skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
@@ -2052,10 +2275,31 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 }
                 decrypt::Ended::Unlocked(Ok(still)) => {
                     closed = still;
-                    show_closed(&mut app, &closed)?;
+                    // The unlock worked: what was entered opens the files,
+                    // so it is what the recovery keeps where the settings
+                    // say it opens them by itself.
+                    if app.state.auto_decrypt {
+                        if let Some(credential) = entered.take() {
+                            if let Err(e) = settings::keep_credential(&credential) {
+                                skyward_sys::kmsg(&format!("the credential was not kept: {e:#}"))?;
+                            }
+                        }
+                    }
+                    entered = None;
+                    by_itself = false;
+                    if let Some(seen) = show_closed(&mut app, &closed)? {
+                        lock_seen = Some(seen);
+                    }
                 }
                 decrypt::Ended::Unlocked(Err(why)) => {
                     skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
+                    entered = None;
+                    // A credential the recovery kept that no longer opens
+                    // the files is forgotten, and the page asks for one.
+                    if by_itself {
+                        by_itself = false;
+                        let _ = settings::forget_credential();
+                    }
                     app.unlock_failed(why, now);
                 }
             }
@@ -2134,6 +2378,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             kept = false;
                         }
                         power(target)?
+                    }
+                    Effect::WirelessAdb(on) => {
+                        let port = if on { "5555" } else { "" };
+                        skyward_sys::set_prop("service.adb.tcp.port", port)?;
+                        // adbd reads the port as it starts, so it starts
+                        // again: the port to a computer stays as it was.
+                        skyward_sys::set_prop("ctl.restart", "adbd")?;
+                        skyward_sys::kmsg(if on {
+                            "adbd listens on the network beside the port"
+                        } else {
+                            "adbd listens on the port alone"
+                        })?;
                     }
                     Effect::Dismiss => {
                         if kept {
@@ -2299,9 +2555,39 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::Unlock { user, code } => {
                         ensure!(decryptor.is_none(), "the data partition is being opened already");
-                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
+                        let credential = code.into_bytes();
+                        entered = Some(credential.clone());
+                        by_itself = false;
+                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential };
                         decryptor = Some(Decryptor::start(job)?);
                     }
+                    // The owner agreed to keep the credential: the decrypt
+                    // page asks for it once more, and keeping it happens
+                    // with the unlock that follows.
+                    Effect::EnableAutoDecrypt => {
+                        app.enable_auto_decrypt();
+                        // The credential is asked for once, to keep it, where
+                        // the screen lock it is entered at is known; a
+                        // partition opened without one this session keeps the
+                        // setting and takes the credential at the next unlock.
+                        if let Some(waiting) = lock_seen {
+                            app.ask_credential(Some(waiting));
+                        }
+                    }
+                    // Kept or forgotten as the settings page asked, once the
+                    // owner has been told what keeping it costs.
+                    Effect::Credential(kept) => match kept {
+                        Some(credential) => {
+                            if let Err(e) = settings::keep_credential(&credential) {
+                                skyward_sys::kmsg(&format!("the credential was not kept: {e:#}"))?;
+                            }
+                        }
+                        None => {
+                            if let Err(e) = settings::forget_credential() {
+                                skyward_sys::kmsg(&format!("the credential was not forgotten: {e:#}"))?;
+                            }
+                        }
+                    },
                     Effect::ReadDir(folder) => list(&mut app, folder)?,
                     Effect::ReadPlace(place, folder) => list_place(&mut app, place, folder)?,
                     // A name taken where an entry goes is the user's to
@@ -2470,6 +2756,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         wlan_worker(&wlan)?.send(wlan::Command::Scan);
                     }
                     Effect::JoinWlan { ssid, name, security, password } => {
+                        // What was joined is kept, so the next start joins it
+                        // without asking for the password again.
+                        app.remember_wlan(&name, &password.0, security);
                         wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
@@ -2575,16 +2864,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // init stops fastbootd as the port goes through "none";
                     // then the slot's partitions come up as at boot.
                     Effect::EnterRecovery => {
-                        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
                         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        crate::prepare(cfg, slot)?;
-                        read_at = Instant::now();
-                        info = skyward_info::collect(cfg)?;
-                        fastboot = false;
-                        app.enter_recovery();
-                        if let Some(w) = systems_worker.as_mut() {
-                            w.send(systems::Task::Resume);
-                        }
+                        let owned = cfg.clone();
+                        let (tell, told) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let done = (|| -> Result<()> {
+                                skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
+                                crate::prepare(&owned, slot)
+                            })();
+                            let _ = tell.send(done);
+                        });
+                        entering = Some(told);
+                        app.entering_recovery();
                     }
                     // A port that something else has takes file transfer
                     // on, or leaves it, when it comes back to rest.

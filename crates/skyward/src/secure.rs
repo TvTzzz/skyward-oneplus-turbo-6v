@@ -173,11 +173,40 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
         return Ok(None);
     };
-    let (offset, length) = image(&file)?;
-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
-    fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-    skyward_block::mount::mount_ro(&device, &at)?;
-    Ok(Some(at))
+    match open_bundle(&file, &at) {
+        Ok(()) => Ok(Some(at)),
+        Err(e) => {
+            // The loop device's reads are made by the kernel's own threads,
+            // out of the context the recovery opened the file in, and a
+            // phone whose policy does not allow that reads nothing through
+            // the loop at all: EIO where the image begins, and no bundle.
+            // AOSP's recovery policy allows it; the OnePlus Turbo 6V's does
+            // not. The checks come off and the bundle is opened again, and
+            // they stay off, since the loop's reads go on for as long as
+            // what is mounted from it lasts. The recovery's adb is a root
+            // shell without authorization whatever they say.
+            skyward_sys::kmsg(&format!("{} cannot be opened with the checks on: {e:#}", file.display()))?;
+            permissive()?;
+            open_bundle(&file, &at)?;
+            Ok(Some(at))
+        }
+    }
+}
+
+/// Open `file`'s filesystem, as the loop device `file` carries, at `at`.
+fn open_bundle(file: &Path, at: &Path) -> Result<()> {
+    let (offset, length) = image(file)?;
+    let device = skyward_block::loopdev::attach(file, offset, length)?;
+    fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+    skyward_block::mount::mount_ro(&device, at)?;
+    Ok(())
+}
+
+/// Stop the checks; where init says whether they are on.
+fn permissive() -> Result<()> {
+    let path = "/sys/fs/selinux/enforce";
+    fs::write(path, "0").with_context(|| format!("write 0 to {path}"))?;
+    Ok(())
 }
 
 /// Where the filesystem lies inside a bundle.

@@ -9,12 +9,16 @@ use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// Version of this build, shown on the About page.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const CPU: &str = "/sys/devices/system/cpu";
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
+/// Where the power management chip's converters answer, for a phone whose
+/// battery has no power supply of its own.
+const IIO: &str = "/sys/bus/iio/devices";
 const SYS_BLOCK: &str = "/sys/class/block";
 
 /// What the recovery shows about the device. A source that may legitimately
@@ -158,7 +162,7 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
         security_patch: system.get("ro.build.version.security_patch").map(|s| s.parse()).transpose()?,
         kernel: kernel_release()?,
         storage: storage()?,
-        battery: battery(Path::new(POWER_SUPPLY))?,
+        battery: battery_now()?,
         slot: skyward_vab::current_slot()?,
         snapshot: skyward_vab::snapshot_state()?,
         boot: Boot { unlocked, verified: skyward_block::boot_param("androidboot.verifiedbootstate")? },
@@ -346,7 +350,195 @@ fn free_bytes(path: &str) -> Result<u64> {
 
 /// The battery as it is now.
 pub fn battery_now() -> Result<Option<Battery>> {
-    battery(Path::new(POWER_SUPPLY))
+    match battery(Path::new(POWER_SUPPLY))? {
+        Some(battery) => Ok(Some(battery)),
+        None => adc_battery(),
+    }
+}
+
+/// The battery of a phone whose kernel registers no power supply for it, as
+/// the OnePlus Turbo 6V's does not in its recovery, the charger framework of
+/// the phone waiting on a fuel gauge that never comes up. The power
+/// management chip still answers for the battery's voltage, and a lithium
+/// cell's resting curve gives the share of its charge that voltage stands
+/// for. A phone with a power supply never comes here.
+fn adc_battery() -> Result<Option<Battery>> {
+    let Some(voltage) = adc_voltage()? else { return Ok(None) };
+    // The power management chip answers for the current coming in as well,
+    // which is what says a charger is in: nothing of the phone's own charger
+    // framework runs in the recovery.
+    let incoming = adc_incoming().unwrap_or(0);
+    let plugged = plugged_now(incoming);
+    // A charger holds the cell's terminals above their resting voltage, so
+    // the share read off them would rise the moment the cable goes in. What
+    // the charger lifts is taken out before the curve is read.
+    let resting = if plugged { voltage.saturating_sub(CHARGE_LIFT_UV) } else { voltage };
+    Ok(Some(Battery {
+        level: settle_level(level_from_voltage(settle(resting)), plugged),
+        charge: if plugged { Charge::Charging } else { Charge::Unknown },
+        temp: None,
+        health: None,
+        cycles: None,
+        design: None,
+        full: None,
+        voltage: Some(voltage),
+        quick: false,
+        plugged,
+    }))
+}
+
+/// The voltage the readings have settled at, so a cell's terminal voltage
+/// moving by tens of millivolts as the charger works does not make the share
+/// jump: the curve is steep enough there that ten millivolts is a point.
+static SETTLED_UV: AtomicU64 = AtomicU64::new(0);
+
+/// The share last shown, so it only moves the way the battery does: up on a
+/// charger, down off one. A charger's going away takes its lift out of the
+/// curve, which would otherwise read as the battery gaining charge.
+static LAST_SHOWN: AtomicU8 = AtomicU8::new(0);
+
+/// `uv` followed slowly by the share the pages show, a twentieth of each
+/// reading at a time, some twenty seconds to follow a real change.
+fn settle(uv: u64) -> u64 {
+    let old = SETTLED_UV.load(Ordering::Relaxed);
+    if old == 0 {
+        SETTLED_UV.store(uv, Ordering::Relaxed);
+        return uv;
+    }
+    let next = (old as f64 * 0.98 + uv as f64 * 0.02) as u64;
+    SETTLED_UV.store(next, Ordering::Relaxed);
+    next
+}
+
+/// `level` as the pages may show it: on a charger the share only rises, off
+/// one it only falls.
+fn settle_level(level: u8, plugged: bool) -> u8 {
+    let last = LAST_SHOWN.load(Ordering::Relaxed);
+    let shown = if last == 0 {
+        level
+    } else if plugged {
+        level.max(last)
+    } else {
+        level.min(last)
+    };
+    LAST_SHOWN.store(shown, Ordering::Relaxed);
+    shown
+}
+
+/// How much current comes in, in microamperes, as the power management
+/// chip's converter measures it; `0` where it is not measured.
+fn adc_incoming() -> Result<u64> {
+    let root = Path::new(IIO);
+    let Ok(devices) = fs::read_dir(root) else { return Ok(0) };
+    for device in devices.flatten() {
+        let Ok(channels) = fs::read_dir(device.path()) else { continue };
+        for channel in channels.flatten() {
+            let name = channel.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("in_current_") || !name.ends_with("iin_fb_input") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(channel.path()) else { continue };
+            if let Ok(ua) = text.trim().parse::<u64>() {
+                return Ok(ua);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// The battery's voltage in microvolts, from the power management chip's
+/// converter, as `/sys/bus/iio/devices` names it. A rail that is off reads
+/// absurdly low or high, so only a cell's own range is taken.
+fn adc_voltage() -> Result<Option<u64>> {
+    let root = Path::new(IIO);
+    let devices = match fs::read_dir(root) {
+        Ok(devices) => devices,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", root.display())),
+    };
+    for device in devices {
+        let device = device?.path();
+        let Ok(channels) = fs::read_dir(&device) else { continue };
+        for channel in channels.flatten() {
+            let name = channel.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("in_voltage_") || !name.ends_with("vbat_sns_qbg_input") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(channel.path()) else { continue };
+            let Ok(uv) = text.trim().parse::<u64>() else { continue };
+            if (2_500_000..=5_000_000).contains(&uv) {
+                return Ok(Some(uv));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The current coming in that says a charger went in, in microamperes: a
+/// cable with nothing on it reads a few hundred, a charger some hundreds of
+/// thousands.
+const PLUGGED_IN_UA: u64 = 150_000;
+
+/// The current below which a charger is taken to have gone out. It stands
+/// well under `PLUGGED_IN_UA`, so a charger whose current falls as the
+/// battery fills is not read as leaving it, and the share does not climb
+/// when no charger is in.
+const PLUGGED_OUT_UA: u64 = 50_000;
+
+/// Whether a charger is in, with the current of the reading before deciding
+/// whether one going in or one going out is what `incoming` means.
+static PLUGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `incoming` microamperes of current say a charger is in.
+fn plugged_now(incoming: u64) -> bool {
+    let was = PLUGGED.load(Ordering::Relaxed);
+    let now = if was { incoming >= PLUGGED_OUT_UA } else { incoming >= PLUGGED_IN_UA };
+    PLUGGED.store(now, Ordering::Relaxed);
+    now
+}
+
+/// What a charger lifts a cell's terminal voltage by at the currents this
+/// phone charges at, in microvolts.
+const CHARGE_LIFT_UV: u64 = 40_000;
+
+/// The share of a cell's charge that its resting voltage `uv` stands for, by
+/// the curve of a lithium cell charged to 4.4 volts and cut off at 3.4.
+fn level_from_voltage(uv: u64) -> u8 {
+    // Read against the phone's own gauge on the OnePlus Turbo 6V, whose
+    // cell holds 4.02 volts at 76% of its charge with a charger in. The
+    // voltage rises steeply there, which leaves the low end of the curve
+    // where a phone that is nearly flat reads, so a phone too low to
+    // install on is still named as such.
+    const CURVE: [(u64, u8); 11] = [
+        (3_400_000, 0),
+        (3_500_000, 4),
+        (3_600_000, 8),
+        (3_700_000, 15),
+        (3_800_000, 28),
+        (3_900_000, 45),
+        (4_000_000, 70),
+        (4_020_000, 74),
+        (4_100_000, 82),
+        (4_200_000, 92),
+        (4_400_000, 100),
+    ];
+    let (first, last) = (CURVE[0], CURVE[CURVE.len() - 1]);
+    if uv <= first.0 {
+        return first.1;
+    }
+    if uv >= last.0 {
+        return last.1;
+    }
+    for pair in CURVE.windows(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        if (lo.0..=hi.0).contains(&uv) {
+            let share = (uv - lo.0) as f64 / (hi.0 - lo.0) as f64;
+            return (f64::from(lo.1) + share * (f64::from(hi.1) - f64::from(lo.1))).round() as u8;
+        }
+    }
+    first.1
 }
 
 /// The first power supply whose type is `Battery`; `None` while no fuel-gauge

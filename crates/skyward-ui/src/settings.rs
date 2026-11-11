@@ -5,10 +5,11 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SavedWlan, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use skyward_net::supplicant::Security;
 
 /// How long settings stand unchanged before they are written, so a slider
 /// dragged across the page is written once, after the hand stops.
@@ -23,6 +24,15 @@ const USB_DRIVE: &str = "usb_drive";
 /// that exports them.
 const LOGS: [&str; 2] = ["recovery", "kernel"];
 const LOG_PLACES: [&str; 2] = ["temporary", "storage"];
+
+/// A WLAN the pages joined before.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedNetwork {
+    pub name: String,
+    pub password: String,
+    /// The security it was joined with, by name: open, owe, psk or sae.
+    pub security: String,
+}
 
 /// The settings as they are kept. A value missing is the one a recovery
 /// starts with, and one this version does not know is left out.
@@ -39,16 +49,35 @@ pub struct Settings {
     pub dark: bool,
     /// The brightness slider's place, from 0 at its left end to 1.
     pub brightness: f32,
+    /// The refresh rate the panel is kept at, in Hz; 0 for the fastest it
+    /// offers.
+    pub refresh: u32,
     /// How long the screen stays on with nothing touched, in seconds; 0
     /// keeps it on.
     pub screen_off: u64,
     /// The time zone, by its name in the tz database.
     pub time_zone: String,
+    /// The clock writes a morning and an afternoon, 12 hours twice.
+    pub hours12: bool,
     pub vibrate: bool,
     /// The vibration slider's place, from 0 at its left end to 1.
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// adbd listens on the network beside the port.
+    pub wireless_adb: bool,
+    /// The recovery opens the owner's files by itself with the credential it
+    /// kept, rather than asking for it at each start.
+    pub auto_decrypt: bool,
+    /// The WLANs joined before, with the passwords they were joined with.
+    #[serde(default)]
+    pub wlan: Vec<SavedNetwork>,
+    /// The networks kept are joined by themselves as the WLAN comes up.
+    pub auto_wlan: bool,
+    /// Installing is not held back for the charge the pages read.
+    pub no_battery_check: bool,
+    /// The recovery starts straight into its pages, with no frame before.
+    pub no_splash: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -121,11 +150,23 @@ impl Settings {
             spoken: Some(state.lang.tag().to_string()),
             dark: state.dark,
             brightness: state.brightness,
+            refresh: state.refresh,
             screen_off: SCREEN_OFF[state.screen_off].map_or(0, |ms| ms / 1000),
             time_zone: TIME_ZONES[state.time_zone].2.to_string(),
+            hours12: state.hours12,
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
+            wireless_adb: state.wireless_adb,
+            auto_decrypt: state.auto_decrypt,
+            auto_wlan: state.auto_wlan,
+            no_battery_check: state.no_battery_check,
+            no_splash: state.no_splash,
+            wlan: state
+                .saved_wlan
+                .iter()
+                .map(|w| SavedNetwork { name: w.name.clone(), password: w.password.clone(), security: security_name(w.security).to_string() })
+                .collect(),
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -173,17 +214,29 @@ impl Settings {
         if (0.0..=1.0).contains(&self.brightness) {
             state.brightness = self.brightness;
         }
+        state.refresh = self.refresh;
         if let Some(at) = SCREEN_OFF.iter().position(|off| off.map_or(0, |ms| ms / 1000) == self.screen_off) {
             state.screen_off = at;
         }
         if let Some(at) = TIME_ZONES.iter().position(|zone| zone.2 == self.time_zone) {
             state.time_zone = at;
         }
+        state.hours12 = self.hours12;
         state.vibrate = self.vibrate;
         if (0.0..=1.0).contains(&self.vibration) {
             state.vibration = self.vibration;
         }
         state.file_transfer = self.file_transfer;
+        state.wireless_adb = self.wireless_adb;
+        state.auto_decrypt = self.auto_decrypt;
+        state.auto_wlan = self.auto_wlan;
+        state.no_battery_check = self.no_battery_check;
+        state.no_splash = self.no_splash;
+        state.saved_wlan = self
+            .wlan
+            .iter()
+            .filter_map(|w| security_named(&w.security).map(|security| SavedWlan { name: w.name.clone(), password: w.password.clone(), security }))
+            .collect();
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -415,5 +468,26 @@ mod tests {
         keeper.remade();
         keeper.due(dark.clone(), 20_000);
         assert_eq!(keeper.due(dark.clone(), 22_000), Some(dark), "erasing takes the file with it, so it is written again");
+    }
+}
+
+/// The security a network is joined with, as it is kept.
+fn security_name(s: Security) -> &'static str {
+    match s {
+        Security::Open => "open",
+        Security::Owe => "owe",
+        Security::Sae | Security::PskSae => "sae",
+        Security::Wep | Security::Psk | Security::Enterprise => "psk",
+    }
+}
+
+/// The security a kept name stands for, or nothing where it is not one.
+fn security_named(name: &str) -> Option<Security> {
+    match name {
+        "open" => Some(Security::Open),
+        "owe" => Some(Security::Owe),
+        "sae" => Some(Security::Sae),
+        "psk" => Some(Security::Psk),
+        _ => None,
     }
 }

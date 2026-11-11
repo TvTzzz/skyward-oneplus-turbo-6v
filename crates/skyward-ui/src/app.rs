@@ -50,6 +50,11 @@ pub enum Screen {
     Specs,
     /// How long the screen stays on with nothing touched.
     ScreenOff,
+    /// How fast the panel refreshes, chosen from the rates it offers.
+    Refresh,
+    /// The networks kept, with their passwords, and whether the recovery
+    /// joins them by itself.
+    SavedWlan,
     /// Finding a feature or partition by name, typed on the screen's own
     /// keyboard.
     Search,
@@ -559,6 +564,18 @@ pub enum Switch {
     Wlan,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
+    /// Write the clock with a morning and an afternoon, 12 hours twice.
+    Hours12,
+    /// adbd listens on the network beside the port.
+    WirelessAdb,
+    /// Join the kept networks by itself.
+    AutoWlan,
+    /// Install whatever the charge reads.
+    NoBatteryCheck,
+    /// Start with no frame before the pages.
+    NoSplash,
+    /// The recovery opens the owner's files by itself.
+    AutoDecrypt,
 }
 
 /// What a backup can take, in the order the backup page lists it.
@@ -798,6 +815,16 @@ pub struct MountFailure {
     pub base: String,
     /// The error and its causes.
     pub detail: String,
+}
+
+/// A WLAN the pages joined before, kept so the next start joins it without
+/// asking for its password again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedWlan {
+    /// The network's name as it is shown, and its SSID as it was joined.
+    pub name: String,
+    pub password: String,
+    pub security: Security,
 }
 
 /// Which control answers a user's screen lock, by the kind of lock it is.
@@ -1199,6 +1226,10 @@ pub enum Action {
     Dismiss,
     /// Keep the screen on for this choice in [`SCREEN_OFF`].
     ScreenOff(usize),
+    /// Refresh the panel at this rate in Hz, 0 for the fastest it offers.
+    Refresh(u32),
+    /// Forget the network kept at this place in the list of saved ones.
+    ForgetWlan(usize),
     /// Keep the time zone at this place in [`TIME_ZONES`].
     TimeZone(usize),
     /// Speak this language.
@@ -1582,18 +1613,43 @@ pub struct State {
     pub language_chosen: bool,
     pub dark: bool,
     pub brightness: f32,
+    /// The refresh rate the panel is kept at, in Hz; 0 keeps it at the
+    /// fastest rate it offers.
+    pub refresh: u32,
+    /// The refresh rates the panel offers at its own size, from the
+    /// slowest; the display fills them in once it is open.
+    pub refresh_rates: Vec<u32>,
     /// How long the screen stays on with nothing touched, by its place in
     /// [`SCREEN_OFF`].
     pub screen_off: usize,
     /// The time zone the clock and the times on the pages keep, by its
     /// place in [`TIME_ZONES`].
     pub time_zone: usize,
+    /// The clock writes a morning and an afternoon, 12 hours twice.
+    pub hours12: bool,
+    /// The fastboot page is handing over to the recovery's own pages: the
+    /// port goes back to adb and the partitions are mounted again.
+    pub entering: bool,
     pub vibrate: bool,
     /// How strongly the motor taps, from 0 at the slider's left end to 1
     /// at its right.
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// adbd listens on the network beside the port, for a computer on the
+    /// same network to reach the recovery without a cable.
+    pub wireless_adb: bool,
+    /// The WLANs joined before, with the passwords they were joined with.
+    pub saved_wlan: Vec<SavedWlan>,
+    /// The networks kept are joined by themselves as the WLAN comes up.
+    pub auto_wlan: bool,
+    /// Installing is not held back for the charge the pages read.
+    pub no_battery_check: bool,
+    /// The recovery starts straight into its pages, with no frame before.
+    pub no_splash: bool,
+    /// The recovery opens the owner's files by itself with the credential it
+    /// kept, rather than asking for it at each start.
+    pub auto_decrypt: bool,
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
@@ -1759,12 +1815,22 @@ impl Default for State {
             language_chosen: false,
             dark: false,
             brightness: SLIDER_START,
+            refresh: 0,
+            refresh_rates: Vec::new(),
             // Two minutes.
             screen_off: 3,
             time_zone: 0,
+            hours12: false,
+            entering: false,
             vibrate: true,
             vibration: SLIDER_START,
             file_transfer: true,
+            wireless_adb: false,
+            saved_wlan: Vec::new(),
+            auto_wlan: true,
+            no_battery_check: false,
+            no_splash: false,
+            auto_decrypt: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
@@ -1964,6 +2030,13 @@ pub enum Effect {
     Screenshot { storage: bool },
     /// Offer internal storage to a computer over USB, or stop.
     FileTransfer(bool),
+    /// Have adbd listen on the network beside the port, or stop.
+    WirelessAdb(bool),
+    /// Keep the credential the pages' next unlock uses, or forget it.
+    Credential(Option<Vec<u8>>),
+    /// The owner agreed to keep the credential: the pages ask for it once
+    /// more, to be sure it opens their files.
+    EnableAutoDecrypt,
     /// Start receiving a package over USB.
     Sideload,
     /// Start installing the file at this path from the top of a place,
@@ -2877,9 +2950,18 @@ impl App {
         Some((n.is_multiple_of(2), since + (n + 1) * BLINK_MS))
     }
 
+    /// The page is worked from a computer, with no finger ever coming to it:
+    /// the fastboot page's panel stays lit however long the work takes.
+    fn stays_lit(&self) -> bool {
+        self.screen() == Screen::Fastboot
+    }
+
     /// When sitting idle next changes the lit panel: when it dims, or once
     /// it is dimming, when it goes off.
     fn idle_due(&self) -> Option<u64> {
+        if self.stays_lit() {
+            return None;
+        }
         let (active, after) = (self.active?, SCREEN_OFF[self.state.screen_off]?);
         if !self.display_on {
             return None;
@@ -2928,7 +3010,7 @@ impl App {
             }
         }
         let active = *self.active.get_or_insert(now);
-        if let (true, Some(after)) = (self.display_on, SCREEN_OFF[self.state.screen_off]) {
+        if let (true, Some(after)) = (self.display_on && !self.stays_lit(), SCREEN_OFF[self.state.screen_off]) {
             let idle = now.saturating_sub(active);
             if idle >= after {
                 self.sleep(now);
@@ -3325,6 +3407,63 @@ impl App {
 
     /// Fastboot has stopped and the recovery is up: its pages start again
     /// from the home page, which nothing can go back from to fastboot.
+    /// A network the pages just joined is kept, with the password it was
+    /// joined with, so the next start joins it without asking.
+    pub fn remember_wlan(&mut self, name: &str, password: &str, security: Security) {
+        self.state.saved_wlan.retain(|w| w.name != name);
+        self.state.saved_wlan.push(SavedWlan { name: name.to_string(), password: password.to_string(), security });
+        if self.state.saved_wlan.len() > 16 {
+            self.state.saved_wlan.remove(0);
+        }
+        self.refresh();
+    }
+
+    /// A kept network is forgotten: its password no longer opens it, or the
+    /// owner asked for it gone.
+    pub fn forget_wlan(&mut self, name: &str) {
+        self.state.saved_wlan.retain(|w| w.name != name);
+        self.refresh();
+    }
+
+    /// The network kept for the name, where one is.
+    pub fn saved_wlan(&self, name: &str) -> Option<&SavedWlan> {
+        self.state.saved_wlan.iter().find(|w| w.name == name)
+    }
+
+    /// The settings page has been told what keeping the credential costs,
+    /// and the owner agreed: the pages ask for it once more.
+    pub fn enable_auto_decrypt(&mut self) {
+        self.state.auto_decrypt = true;
+        self.refresh();
+    }
+
+    /// Ask for the credential again, over the pages, as the decrypt page
+    /// does at the start. The page asks for the lock the data partition was
+    /// opened with; a partition not yet opened keeps the state it had, so
+    /// the page reads it as it stands.
+    pub fn ask_credential(&mut self, waiting: Option<(u32, Keys)>) {
+        if let Some((user, keys)) = waiting {
+            self.state.data = Data::Locked { user, keys, checking: false };
+            self.state.code.clear();
+        }
+        self.stack = vec![(Screen::Decrypt, 0.0, Focus::Unset)];
+        self.settle_page();
+        self.refresh();
+    }
+
+    /// The fastboot page hands over to the recovery's own pages, and the
+    /// page says so while it goes on.
+    pub fn entering_recovery(&mut self) {
+        self.state.entering = true;
+        self.refresh();
+    }
+
+    /// The hand-over ended, whether or not it worked.
+    pub fn entered(&mut self) {
+        self.state.entering = false;
+        self.refresh();
+    }
+
     pub fn enter_recovery(&mut self) {
         self.stack = vec![(Screen::Home, 0.0, Focus::Unset)];
         self.settle_page();
@@ -5112,6 +5251,12 @@ impl App {
     }
 
     /// Open the data partition, the decrypt page saying so meanwhile.
+    /// Open the data partition without being asked, as the settings page
+    /// said the recovery may: the page shows it opening as it would.
+    pub fn open_by_itself(&mut self) -> Vec<Effect> {
+        self.open_data()
+    }
+
     fn open_data(&mut self) -> Vec<Effect> {
         self.state.data = Data::Opening;
         self.refresh();
@@ -5156,12 +5301,29 @@ impl App {
             }
             // The switch moves at once; the runtime then tells how the WLAN
             // came up, or went off.
+            Action::ForgetWlan(i) => {
+                if let Some(w) = self.state.saved_wlan.get(i).map(|w| w.name.clone()) {
+                    self.forget_wlan(&w);
+                }
+            }
             Action::Toggle(Switch::Wlan) => {
                 let w = self.state.wlan.as_mut().expect("the WLAN switch shows on a phone whose WLAN is brought up");
                 let on = matches!(w.power, Power::Off | Power::Failed(_));
                 *w = Wlan { power: if on { Power::Starting } else { Power::Off }, ..Wlan::default() };
                 self.refresh();
                 return vec![Effect::Wlan(on)];
+            }
+            // Turning automatic decryption on asks for the credential once,
+            // to keep it; turning it off keeps nothing.
+            Action::Toggle(Switch::AutoDecrypt) => {
+                if self.state.auto_decrypt {
+                    self.state.auto_decrypt = false;
+                    self.refresh();
+                    return vec![Effect::Credential(None)];
+                }
+                self.state.auto_decrypt = true;
+                self.refresh();
+                return vec![Effect::EnableAutoDecrypt];
             }
             Action::Toggle(switch) => {
                 let on = match switch {
@@ -5172,6 +5334,12 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
+                    Switch::Hours12 => &mut self.state.hours12,
+                    Switch::WirelessAdb => &mut self.state.wireless_adb,
+                    Switch::AutoWlan => &mut self.state.auto_wlan,
+                    Switch::NoBatteryCheck => &mut self.state.no_battery_check,
+                    Switch::NoSplash => &mut self.state.no_splash,
+                    Switch::AutoDecrypt => unreachable!("the automatic decryption switch is turned above"),
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -5179,6 +5347,9 @@ impl App {
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
+                }
+                if switch == Switch::WirelessAdb {
+                    return vec![Effect::WirelessAdb(now_on)];
                 }
             }
             Action::MountToggle(i) => {
@@ -5352,6 +5523,10 @@ impl App {
             }
             Action::ScreenOff(k) => {
                 self.state.screen_off = k;
+                self.refresh();
+            }
+            Action::Refresh(hz) => {
+                self.state.refresh = hz;
                 self.refresh();
             }
             Action::TimeZone(k) => {
@@ -6077,13 +6252,28 @@ impl App {
                     }
                     Some((Action::Pattern, _)) => {
                         self.state.pattern.clear();
-                        self.trace(&t, x, y + scroll);
+                        // Each dot joined taps the motor, as the phone's own
+                        // pattern lock does.
+                        if self.trace(&t, x, y + scroll) && self.state.vibrate {
+                            fx.push(Effect::Haptic);
+                        }
                         Drag::Pattern
                     }
                     _ => {
                         if let Some(rect) = row {
                             self.row_press = Some(RowPress { rect, rise: now + ROW_PRESS_DELAY_MS, fall: None });
                             self.row_art = None;
+                        }
+                        // Every control that answers a touch taps the motor
+                        // as the finger lands, as the phone's own pages do;
+                        // the sliders and the confirmation slides tap as
+                        // they move instead.
+                        if self.state.vibrate
+                            && action.is_some_and(|a| {
+                                !matches!(a, Action::Slider(_) | Action::Confirm(_) | Action::Pattern | Action::TypeInto(_))
+                            })
+                        {
+                            fx.push(Effect::Haptic);
                         }
                         Drag::Press { x, y, action, edge: at_edge, at: now }
                     }
@@ -6145,7 +6335,9 @@ impl App {
                     self.drag = Drag::Confirm { which, track, grab };
                 }
                 Drag::Pattern => {
-                    self.trace(&t, x, y + scroll);
+                    if self.trace(&t, x, y + scroll) && self.state.vibrate {
+                        fx.push(Effect::Haptic);
+                    }
                     self.drag = Drag::Pattern;
                 }
                 Drag::History { last, carry, pitch } => {
@@ -6990,22 +7182,25 @@ impl App {
     }
 
     /// Add the dot under the finger to the pattern being drawn.
-    fn trace(&mut self, t: &Theme, x: f32, y: f32) {
-        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return };
+    /// Join the dot under the finger to the pattern being drawn, and say
+    /// whether one was joined.
+    fn trace(&mut self, t: &Theme, x: f32, y: f32) -> bool {
+        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return false };
         let reach = t.m.dp(widgets::PATTERN_REACH_DP);
         let dots = widgets::pattern_dots(cx, cy, span);
         if let Some(i) = dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
-            self.join(t, i);
+            return self.join(t, i);
         }
+        false
     }
 
     /// Join dot `i` to the pattern being drawn, after the dot it passes
     /// straight over on its way from the last one, as the system's pattern
     /// lock joins that one too. A dot joined once is not joined again.
-    fn join(&mut self, t: &Theme, i: usize) {
+    fn join(&mut self, t: &Theme, i: usize) -> bool {
         let drawn = &mut self.state.pattern;
         if drawn.contains(&i) {
-            return;
+            return false;
         }
         if let Some(&last) = drawn.last() {
             let (row, col) = ((last / 3) as i32, (last % 3) as i32);
@@ -7020,6 +7215,7 @@ impl App {
         }
         drawn.push(i);
         self.repaint_pattern(t);
+        true
     }
 
     fn repaint_pattern(&mut self, t: &Theme) {

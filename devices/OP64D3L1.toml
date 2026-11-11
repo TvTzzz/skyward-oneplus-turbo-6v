@@ -1,0 +1,158 @@
+# 一加 Turbo 6V（PLY110 / OP64D3L1）
+#
+# 草稿: 用 adb 抓到的运行时信息填的，标 TODO 的字段还没确定。
+# 这台机器 Skyward 上游没有支持（21 个配置全是小米），所以这份配置
+# 只能算调研记录，不能直接产出可用镜像。
+
+[device]
+codename = "OP64D3L1"
+brand = "OnePlus"
+model = "PLY110 (一加 Turbo 6V)"
+ab = true
+soc = { hans = "高通 骁龙 SM7635", hant = "高通 驍龍 SM7635", en = "Qualcomm Snapdragon SM7635" }
+# 默认 ro.build.display.id = PLY110_16.0.5.702(CN01)
+os_version_prop = "ro.build.display.id"
+
+[display]
+width = 1272
+height = 2772
+density = 560
+diagonal = 6.7
+# dumpsys display 报的圆角半径
+corner_radius = 169
+
+[modules]
+# 屏幕触摸: Synaptics S3910 走 SPI，外挂在一加的 HBP(hbp_core) 层之下。
+# 依赖链按 /proc/modules 的 refcount 推出来的，实际加载顺序要上机试。
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+load = [
+    "oplus_bsp_tp_common",
+    "oplus_bsp_tp_custom",
+    "oplus_bsp_tp_notify",
+    "oplus_bsp_fw_update",
+    "oplus_bsp_synaptics_tcm2",
+    "oplus_bsp_tp_syna_common",
+    "oplus_hbp_core",
+    "oplus_bsp_tp_hbp_syna_s3910",
+]
+
+# TODO: 触摸初始化。一加的 HBP 层把节点放在
+#   /sys/class/synaptics_tcm_hbp/tcm0/
+#   /sys/class/hbp_core/hbp_core/
+# 具体要写哪个开关让驱动自己上报坐标（而不是只发原始帧），没 root 读不到，
+# 需要对照原厂 init.touchDaemon.rc 和 hbp 驱动源码确定。
+#[touch]
+#writes = [{ path = "...", value = "..." }]
+
+# WLAN 固件在 modem 分区（/vendor/firmware_mnt 挂在 /dev/block/sde6 = modem_a）
+[firmware]
+partition = "modem"
+
+# persist 在 /dev/block/sda2，挂载点 /mnt/vendor/persist
+[partitions]
+mounted = ["persist"]
+
+# ---- 原厂 init 脚本里抄的 user / group ----
+
+[[service]]
+path = "/vendor/bin/qseecomd"
+libraries = ["/system/lib64", "/vendor/lib64"]
+user = "root"
+groups = ["root", "drmrpc"]
+# TODO: ready_property，小米是 vendor.sys.listeners.registered，一加要实测
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+registers = [
+    "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
+user = "system"
+groups = ["system", "drmrpc"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.boot.IBootControl/default"
+user = "root"
+groups = ["root"]
+
+# TODO: weaver。这台没有独立 weaver 服务，秘密存在 /odm/bin/hw 的
+# android.hardware.secure_element-service-tms（Thales）里，但一加是否
+# 走 weaver 协议还没确认。
+
+# 一加的触摸是由 HAL 驱动的：驱动（oplus_bsp_tp_hbp_syna_s3910 +
+# oplus_hbp_core）只通过 /dev/hbp0 、/dev/tcm0 跟 HAL 交换数据，
+# 坐标由这个 HAL 生成。不启动它，/dev/input/event4("touchpanel")
+# 一条事件都不会有。
+[[service]]
+path = "/odm/bin/hw/vendor-oplus-hardware-touch-V2-hbp5-service"
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64"]
+ready_service = "vendor.oplus.hardware.touch.IOplusTouch/default"
+user = "root"
+groups = ["root", "system"]
+capabilities = ["SYS_NICE"]
+
+[wlan]
+# rfkill 必须排在最前：GKI 把它放在 system_dlkm，而 vendor_dlkm 的
+# modules.dep 不记录这条跨分区的依赖，不显式写就会出现
+# "cfg80211: Unknown symbol rfkill_alloc" 然后 finit_module 报 ENOENT。
+modules = ["rfkill", "icnss2", "qca_cld3_qca6750"]
+# WCN6750 的固件启动开关。写 1 之后 icnss2 拉起 WPSS、下载
+# qca6750/regdb.bin 和 bdwlan.elf，然后 wlan0 / p2p0 / wifi-aware0 出现。
+writes = [{ path = "/sys/kernel/icnss/wpss_boot", value = "1" }]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://conn1.oppomobile.com/generate_204"
+
+# TODO: 一加的 OTA 服务器
+#[update]
+#server = ""
+
+# TODO: 振动。节点是 /sys/class/haptic_fb_class/haptic_fb_device，
+# 但共振频率/强度系数要实测。
+#[haptics]
+#resonance = ""
+#strength = { lightest = 0.25, strongest = 0.75 }
+
+# 一加的马达走 timed-output LED 接口（AW 系列驱动），内核没给它
+# evdev force-feedback 设备，所以不能用 Skyward 默认的 FF 波形路径。
+# 写 duration(ms) + brightness(0-255) + activate=1 即可。
+# f0 = 1728（172.8 Hz），跟小米 17 Ultra 的 172.7 Hz 基本一样。
+[haptics]
+led = "/sys/class/leds/vibrator"
+# 驱动在开机第 9 秒就去 persist 找波形固件 aw8697_haptic_170.bin，
+# 那时分区还没挂上，失败后就一直拒绝播放。分区挂好后写它一次即可。
+reload = "/sys/class/leds/vibrator/ram_update"
+# 亮度（brightness）对这个驱动没用：播放的是 RAM 里的波形，振幅只认 gain。
+# 驱动播完会把 gain 复位成 0x80，所以每次振动前都要重新写。
+gain = "/sys/class/leds/vibrator/gain"
+strength = { lightest = 0.2, strongest = 0.85 }
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+# TODO: 一加的安全世界数据目录
+data_skipped = []
+
+[wipe]
+# TODO: 一加的日志目录（/data/oplus/... ?）
+logs = []
+
+# 放在最后：这个 HAL 在这台机器上起不来（exit 1），排在它后面的服务
+# 会因为等它注册 20 秒超时而全部被跳过。
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper-service-qti"
+# libqtigatekeeper.so 在 hw/ 子目录里，不加就 DT_NEEDED 找不到
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw"]
+ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
+# 这台机器的 gatekeeper 声明在 /vendor/etc/vintf/manifest_volcano.xml，
+# 不在 manifest/ 子目录里，Skyward 默认扫不到，得单独复制进去。
+description = "/vendor/etc/vintf/manifest_volcano.xml"
+user = "system"
+groups = ["system"]
+# 原厂 rc 里是 disabled，靠 property:vendor.gatekeeper.is_security_level_spu=0 才 enable

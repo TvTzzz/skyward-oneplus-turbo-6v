@@ -211,9 +211,27 @@ pub struct Haptics {
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
+    /// The vibrator the kernel drives as a timed-output LED, for a phone
+    /// whose kernel offers no force-feedback device for it: the folder
+    /// under `/sys/class/leds` that takes a duration, a strength and a go.
+    #[serde(default)]
+    pub led: Option<String>,
+    /// The file the motor's driver takes its gain in, `0x00` to `0xFF`,
+    /// where the strength of the waveform it plays is set by one. The
+    /// driver puts its own gain back after each playing, so it is written
+    /// before each.
+    #[serde(default)]
+    pub gain: Option<String>,
+    /// The switch that makes the motor's driver load its waveform again.
+    /// A driver reads it as the motor comes up, before a recovery has
+    /// mounted the partition the waveform is on, and keeps the failure:
+    /// writing 1 once the partitions are up has it load the waveform.
+    #[serde(default)]
+    pub reload: Option<String>,
     /// The file the driver says the motor's resonant frequency in, in
     /// tenths of a hertz whatever its label.
-    pub resonance: String,
+    #[serde(default)]
+    pub resonance: Option<String>,
     pub strength: Strength,
 }
 
@@ -544,8 +562,13 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            if let Some(file) = &haptics.resonance {
+                ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            }
+            ensure!(
+                haptics.led.is_some() || haptics.resonance.is_some(),
+                "[haptics] gives neither a force-feedback resonance nor a led vibrator"
+            );
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,

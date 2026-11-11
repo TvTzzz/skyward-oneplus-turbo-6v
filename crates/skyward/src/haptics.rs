@@ -5,7 +5,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,144 @@ const TICKS_REST: Duration = Duration::from_millis(40);
 /// playing after its samples have run out, even when told to stop, until
 /// the click is taken away. So each click is loaded as it is played, at the
 /// strength the slider gives, and taken away once it has played out.
-pub struct Haptics {
+/// The motor: played through the kernel's force-feedback events where it
+/// has a device for them, or through a timed-output LED where it has that
+/// instead, as the OnePlus Turbo 6V does.
+pub enum Haptics {
+    Effects(Effects),
+    Led(Led),
+}
+
+impl Haptics {
+    pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+        match &cfg.led {
+            Some(dir) => {
+                let led = Led::open(dir, cfg.strength, cfg.reload.as_deref(), cfg.gain.as_deref())?;
+                // The waveform may be reachable already, as on a recovery
+                // whose partitions are up before the pages start.
+                if let Err(e) = led.strike_reload() {
+                    eprintln!("the motor's waveform was not loaded again: {e}");
+                }
+                Ok(Haptics::Led(led))
+            }
+            None => Ok(Haptics::Effects(Effects::open(cfg)?)),
+        }
+    }
+
+    /// One short click at the strength the slider's `position` gives, after
+    /// taking away one still playing. Gives how long it plays.
+    pub fn click(&mut self, position: f32) -> Result<Duration> {
+        match self {
+            Haptics::Effects(e) => e.click(position),
+            Haptics::Led(l) => l.click(position),
+        }
+    }
+
+    /// The ticks of the screen going off, as strong as the phone's own
+    /// system plays them whatever the slider says. Gives how long they play.
+    pub fn ticks(&mut self) -> Result<Duration> {
+        match self {
+            Haptics::Effects(e) => e.ticks(),
+            Haptics::Led(l) => l.ticks(),
+        }
+    }
+
+    /// Have the motor's driver load its waveform again, for one that read
+    /// it before the partitions it lies on were mounted.
+    pub fn reload(&mut self) -> Result<()> {
+        match self {
+            Haptics::Effects(_) => Ok(()),
+            Haptics::Led(l) => l.strike_reload(),
+        }
+    }
+}
+
+/// How long a click of a timed-output motor lasts, and a tick of the screen
+/// going off, with the gap between the two ticks.
+const LED_CLICK: Duration = Duration::from_millis(20);
+const LED_TICK: Duration = Duration::from_millis(14);
+const LED_TICK_GAP: Duration = Duration::from_millis(55);
+
+/// A motor the kernel drives as a timed-output LED: a duration in its
+/// `duration`, a strength in its `brightness`, and a go in its `activate`.
+pub struct Led {
+    dir: PathBuf,
+    max: u32,
+    strength: Strength,
+    /// The file the driver takes the playing waveform's gain in, where it
+    /// does.
+    gain: Option<PathBuf>,
+    /// The switch the driver loads its waveform through, where the phone
+    /// has one.
+    reload: Option<PathBuf>,
+}
+
+impl Led {
+    fn open(dir: &str, strength: Strength, reload: Option<&str>, gain: Option<&str>) -> Result<Led> {
+        let dir = PathBuf::from(dir);
+        let file = dir.join("max_brightness");
+        let max: u32 = fs::read_to_string(&file)
+            .with_context(|| format!("read {}", file.display()))?
+            .trim()
+            .parse()
+            .with_context(|| format!("{} holds no number", file.display()))?;
+        ensure!(max > 0, "{} says the motor takes no strength", file.display());
+        Ok(Led { dir, max, strength, gain: gain.map(PathBuf::from), reload: reload.map(PathBuf::from) })
+    }
+
+    fn click(&mut self, position: f32) -> Result<Duration> {
+        let share = share(&self.strength, position);
+        self.set_gain(share)?;
+        self.go(LED_CLICK, share)?;
+        Ok(LED_CLICK)
+    }
+
+    /// Set the gain the waveform plays at, `share` of the driver's full.
+    /// The driver puts its own gain back after each playing.
+    fn set_gain(&self, share: f32) -> Result<()> {
+        let Some(file) = &self.gain else { return Ok(()) };
+        let value = ((share.clamp(0.0, 1.0) * 255.0).round() as u32).clamp(1, 255);
+        fs::write(file, format!("0x{value:02X}")).with_context(|| format!("write 0x{value:02X} to {}", file.display()))
+    }
+
+    fn ticks(&mut self) -> Result<Duration> {
+        self.set_gain(TICKS_STRENGTH)?;
+        self.go(LED_TICK, TICKS_STRENGTH)?;
+        // The second tick follows the first, lighter, as the phone's own
+        // system plays them; the page is not held waiting for it.
+        let dir = self.dir.clone();
+        let max = self.max;
+        std::thread::spawn(move || {
+            std::thread::sleep(LED_TICK_GAP);
+            if let Err(e) = Led::strike(&dir, max, LED_TICK, TICKS_STRENGTH * 0.79) {
+                eprintln!("the second tick: {e}");
+            }
+        });
+        Ok(LED_TICK_GAP + LED_TICK)
+    }
+
+    fn strike_reload(&self) -> Result<()> {
+        let Some(file) = &self.reload else { return Ok(()) };
+        fs::write(file, "1").with_context(|| format!("write 1 to {}", file.display()))
+    }
+
+    fn go(&self, length: Duration, share: f32) -> Result<()> {
+        Led::strike(&self.dir, self.max, length, share)
+    }
+
+    fn strike(dir: &Path, max: u32, length: Duration, share: f32) -> Result<()> {
+        let level = ((share.clamp(0.0, 1.0) * max as f32).round() as u32).max(1);
+        let write = |name: &str, value: String| -> Result<()> {
+            let file = dir.join(name);
+            fs::write(&file, value).with_context(|| format!("write {}", file.display()))
+        };
+        write("duration", length.as_millis().to_string())?;
+        write("brightness", level.to_string())?;
+        write("activate", "1".to_string())
+    }
+}
+
+pub struct Effects {
     dev: File,
     click: Click,
     ticks: Click,
@@ -79,13 +216,14 @@ enum Click {
     Samples { data: Vec<i8>, rate: u32 },
 }
 
-impl Haptics {
+impl Effects {
     /// The force-feedback device and the configured click. Loading a click
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
-    pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+    pub fn open(cfg: &skyward_config::Haptics) -> Result<Effects> {
         let (path, dev) = motor()?;
-        let hz = resonance(&cfg.resonance)?;
+        let file = cfg.resonance.as_deref().context("[haptics] names no resonance file for a force-feedback motor")?;
+        let hz = resonance(file)?;
         let click = match cfg.click {
             Some(id) => {
                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
@@ -97,7 +235,7 @@ impl Haptics {
             }
         };
         let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Effects { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after

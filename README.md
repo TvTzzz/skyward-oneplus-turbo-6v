@@ -1,3 +1,6 @@
+> **这是 [OnePlus Turbo 6V (PLY110 / OP64D3L1)](PORTING.md) 的移植分支。**
+> 移植细节、踩过的坑和已知限制都在 [PORTING.md](PORTING.md)。
+
 ![Skyward Recovery](assets/hero.jpg)
 
 # Skyward

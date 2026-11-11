@@ -28,6 +28,14 @@ pub fn set_mtp(on: bool) {
 /// Ask init for `config` and wait until it is in place. Going to "none"
 /// also waits for adbd to be gone, so its function is free.
 pub fn set(config: &str, timeout: Duration) -> Result<()> {
+    // init starts adbd for a configuration that carries file transfer only
+    // while this says the port may be configured at all, and a recovery
+    // whose init never sets it waits for adbd that never comes: the pair
+    // never binds and the port is left offering nothing. The Xiaomi builds
+    // set it; the OnePlus Turbo 6V's does not.
+    if config.contains("mtp") {
+        set_prop("sys.usb.config_disable", "0")?;
+    }
     set_prop("sys.usb.config", config)?;
     wait_prop("sys.usb.state", config, timeout)?;
     if config == "none" {

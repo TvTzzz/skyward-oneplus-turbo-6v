@@ -418,7 +418,7 @@ fn main() -> Result<()> {
         Cmd::Ui { config, font, mono, unlock, dump } => {
             let cfg = DeviceConfig::load(&config)?;
             let start = if unlock { skyward_ui::app::Screen::Decrypt } else { skyward_ui::app::Screen::Home };
-            ui::run(&cfg, &font, &mono, bcb::Request::default(), start, dump.as_deref())
+            ui::run(&cfg, &font, &mono, bcb::Request::default(), start, dump.as_deref(), None)
         }
     }
 }
@@ -513,6 +513,23 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
+    // The wireless chip's firmware is brought up as the recovery starts, not
+    // when its page is opened: the driver waits some twenty seconds for the
+    // modem's data service before it makes its interface, and that wait is
+    // better spent before the owner asks for the WLAN than behind the
+    // switch. Why it cannot be brought up goes to the kernel log, as the
+    // page starts it again if it is not there.
+    if let Some(wlan) = &cfg.wlan {
+        for path in load_modules(cfg, &wlan.modules)? {
+            skyward_sys::kmsg(&format!("loaded {} with the WLAN", path.display()))?;
+        }
+        for write in &wlan.writes {
+            match std::fs::write(&write.path, &write.value) {
+                Ok(()) => skyward_sys::kmsg(&format!("wrote {} to {} with the WLAN's driver loading", write.value, write.path))?,
+                Err(e) => skyward_sys::kmsg(&format!("{} was not written: {e}", write.path))?,
+            }
+        }
+    }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
@@ -531,8 +548,15 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     registering.extend(cfg.wlan.iter().map(|w| w.service.clone()));
     let files: Vec<String> = services.iter().filter_map(|s| s.description.clone()).collect();
     if !registering.is_empty() || !files.is_empty() {
-        let described = secure::publish_descriptions(&registering, &files)?;
-        skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
+        // The descriptions are copied before the directory restarts, and a
+        // service that does not come back to it in time leaves them copied
+        // all the same: the touchscreen's, and the ones the pages need, are
+        // what the restart was for, and one that is slow must not stop the
+        // phone's own programs from starting.
+        match secure::publish_descriptions(&registering, &files) {
+            Ok(described) => skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?,
+            Err(e) => skyward_sys::kmsg(&format!("not every service came back to the directory: {e:#}"))?,
+        }
     }
     let libraries = secure::libraries()?;
     if let Some(dir) = &libraries {
@@ -683,6 +707,38 @@ fn recovery() -> Result<()> {
         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
+        // Wireless debugging, where it was kept on, is asked for before adbd
+        // starts: it reads the port as it comes up, and restarting it after
+        // the port is asked for would drop the cable's connection for the
+        // seconds it takes to come back.
+        let kept = crate::settings::read().ok();
+        let settings = kept.as_ref().and_then(|k| k.settings());
+        if settings.is_some_and(|s| s.wireless_adb) {
+            skyward_sys::set_prop("service.adb.tcp.port", "5555")?;
+        }
+        // A page shown before the partitions are mounted is skipped where
+        // the owner asked for the pages at once.
+        let no_splash = settings.is_some_and(|s| s.no_splash);
+        // OPPO's phoenix counts the seconds a recovery may take and restarts
+        // the phone when they run out: 300 of them on the OnePlus Turbo 6V,
+        // which the pages never hear, so the phone restarted in the middle of
+        // being used. The countdown ends with the service that keeps it, and
+        // the recovery needs none of what it does.
+        if skyward_sys::prop("init.svc.phoenix_recovery").is_some() {
+            skyward_sys::set_prop("ctl.stop", "phoenix_recovery")?;
+            skyward_sys::kmsg("the phone's recovery countdown is stopped")?;
+        }
+        // The hardware service directory is linked against the bootstrap
+        // linker of the runtime package, and this recovery's ramdisk carries
+        // neither the package nor the link to it: every start ends with
+        // ENOENT, and init starts it again, so the kernel log fills with a
+        // pair of lines every second and the CPUs with the restarts. The
+        // phone's own services are all described in AIDL and answer to the
+        // directory in /system/bin, which runs.
+        if skyward_sys::prop("init.svc.hwservicemanager").is_some() {
+            skyward_sys::set_prop("ctl.stop", "hwservicemanager")?;
+            skyward_sys::kmsg("the hardware service directory is left stopped")?;
+        }
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.
         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
@@ -747,11 +803,26 @@ fn recovery() -> Result<()> {
             // partitions the system asks for, as in Android's own recovery:
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
+            let root = Path::new("/");
+            let (font, mono) = (root.join(ramdisk::FONT), root.join(ramdisk::MONO));
+            // The panel is given something to show before the partitions are
+            // mounted: that takes seconds, and the panel would be dark for
+            // them.
+            let first = if no_splash {
+                None
+            } else {
+                match ui::splash(&font, &mono) {
+                    Ok(surface) => Some(surface),
+                    Err(e) => {
+                        skyward_sys::kmsg(&format!("the panel was not given a first frame: {e:#}"))?;
+                        None
+                    }
+                }
+            };
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
                 prepare(&cfg, booted_slot()?)?;
             }
-            let root = Path::new("/");
-            ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
+            ui::run(&cfg, &font, &mono, request, Screen::Home, None, first)
         }
         #[cfg(not(target_os = "android"))]
         {

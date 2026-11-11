@@ -74,6 +74,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::About => about(cx),
         Screen::Specs => specs(cx),
         Screen::ScreenOff => screen_off(cx),
+        Screen::Refresh => refresh(cx),
         Screen::Search => search(cx),
         Screen::Backup => backup(cx),
         Screen::Restore => restore(cx),
@@ -106,6 +107,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Clash => clash(cx),
         Screen::FileJob => file_job(cx),
         Screen::Wlan => wlan(cx),
+        Screen::SavedWlan => saved_wlan(cx),
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
@@ -231,7 +233,12 @@ pub fn home(cx: &Ctx) -> Frame {
     // Under the phone's name the card holds only what asks for something to
     // be done: a battery too low to install on, an update waiting to merge,
     // and a restart into the slot the system does not run from now.
-    let low = match i.battery.as_ref().and_then(skyward_install::battery_refusal) {
+    let low = match i
+        .battery
+        .as_ref()
+        .filter(|_| !cx.state.no_battery_check)
+        .and_then(skyward_install::battery_refusal)
+    {
         Some(Refusal::Battery { level, charging }) => Some(fmt::battery_low(l, level, charging)),
         _ => None,
     };
@@ -371,11 +378,29 @@ pub fn settings(cx: &Ctx) -> Frame {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
     }
     y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]));
+    let refresh_text = format!("{} Hz", s.refresh);
+    let refresh_value = if s.refresh == 0 { l.pick(["自动", "自動", "Automatic"]) } else { refresh_text.as_str() };
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
+        Row::new(l.pick(["刷新率", "刷新率", "Refresh rate"])).icon(SLATE, Icon::Restore).trail(Trail::Value(refresh_value)),
+        Row::new(l.pick(["12 小时制", "12 小時制", "12-hour clock"])).icon(SLATE, Icon::Clock).trail(Trail::Switch(s.hours12)),
+        Row::new(l.pick(["自动解密", "自動解密", "Open automatically"])).icon(SLATE, Icon::Backup).trail(Trail::Switch(s.auto_decrypt)),
+        Row::new(l.pick(["忽略电量检测", "忽略電量偵測", "Ignore the charge"])).icon(SLATE, Icon::Battery).trail(Trail::Switch(s.no_battery_check)),
+        Row::new(l.pick(["关闭启动动画", "關閉啟動動畫", "No start screen"])).icon(SLATE, Icon::Power).trail(Trail::Switch(s.no_splash)),
     ]);
-    out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
+    out.extend(hits(
+        &general.rows,
+        &[
+            Action::Open(Screen::Language),
+            Action::Open(Screen::TimeZone),
+            Action::Open(Screen::Refresh),
+            Action::Toggle(Switch::Hours12),
+            Action::Toggle(Switch::AutoDecrypt),
+            Action::Toggle(Switch::NoBatteryCheck),
+            Action::Toggle(Switch::NoSplash),
+        ],
+    ));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
     let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
     out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
@@ -416,6 +441,80 @@ fn skyward_value(cx: &Ctx) -> Option<&'static str> {
         (Some(n), _) if n.newer && n.build.is_some() => Some(l.pick(["有新版本", "有新版本", "New version"])),
         _ => None,
     }
+}
+
+/// How fast the panel refreshes, opened from the settings: the rates the
+/// panel offers at its own size, and the fastest of them on its own.
+pub fn refresh(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = page(cx);
+    let top = t.m.content_top;
+    let automatic = l.pick(["自动（最快）", "自動（最快）", "Automatic (fastest)"]);
+    let labels: Vec<String> =
+        std::iter::once(automatic.to_string()).chain(s.refresh_rates.iter().map(|hz| format!("{hz} Hz"))).collect();
+    let rows: Vec<Row> = labels
+        .iter()
+        .enumerate()
+        .map(|(k, label)| {
+            let chosen = match k {
+                0 => s.refresh == 0,
+                _ => s.refresh == s.refresh_rates[k - 1],
+            };
+            Row::new(label).trail(Trail::Check(chosen))
+        })
+        .collect();
+    let rates = widgets::list(&mut c, t, f, top, &rows);
+    let picks: Vec<Action> =
+        std::iter::once(Action::Refresh(0)).chain(s.refresh_rates.iter().map(|hz| Action::Refresh(*hz))).collect();
+    let note = l.pick([
+        "刷新越快，页面滚动越跟手，耗电也越多。",
+        "刷新越快，頁面捲動越跟手，耗電也越多。",
+        "The faster the panel refreshes, the more smoothly the pages scroll, and the more power it takes.",
+    ]);
+    widgets::footnote(&mut c, t, f, rates.bottom, note);
+    Frame::new(t, c, hits(&rates.rows, &picks), l.pick(["刷新率", "刷新率", "Refresh rate"]), top)
+}
+
+/// The networks joined before, with the passwords they were joined with, and
+/// whether the recovery joins them by itself.
+pub fn saved_wlan(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let auto = Row::new(l.pick(["自动连接", "自動連線", "Join automatically"])).icon(BLUE, Icon::Globe).trail(Trail::Switch(s.auto_wlan));
+    let switch = widgets::list(&mut c, t, f, top, &[auto]);
+    out.extend(hits(&switch.rows, &[Action::Toggle(Switch::AutoWlan)]));
+    let note = l.pick([
+        "开启后，打开 WLAN 时会自动连接下面保存过的网络。",
+        "開啟後，開啟 Wi-Fi 時會自動連線下面儲存過的網路。",
+        "When on, the networks kept below are joined by themselves as the WLAN comes up.",
+    ]);
+    let mut y = widgets::footnote(&mut c, t, f, switch.bottom, note);
+    if s.saved_wlan.is_empty() {
+        let empty = l.pick([
+            "还没有保存的网络。连接一次之后，名称和密码会记在这里。",
+            "還沒有儲存的網路。連線一次之後，名稱和密碼會記在這裡。",
+            "No networks kept yet. One joined once keeps its name and password here.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, y, empty);
+        return Frame::new(t, fit(c, t, y), out, l.pick(["已保存的网络", "已儲存的網路", "Saved networks"]), top);
+    }
+    y = widgets::section(&mut c, t, f, y, l.pick(["网络与密码", "網路與密碼", "Networks and passwords"]));
+    let rows: Vec<Row> = s
+        .saved_wlan
+        .iter()
+        .map(|w| Row::new(&w.name).subtitle(&w.password).trail(Trail::Value(l.pick(["删除", "刪除", "Forget"]))))
+        .collect();
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    let forget: Vec<Action> = (0..s.saved_wlan.len()).map(Action::ForgetWlan).collect();
+    out.extend(hits(&list.rows, &forget));
+    let y = widgets::footnote(&mut c, t, f, list.bottom, l.pick([
+        "点一下即删除该网络的记录，下次连接会重新输入密码。",
+        "點一下即刪除該網路的記錄，下次連線會重新輸入密碼。",
+        "Tap one to forget it; joining it again asks for its password.",
+    ]));
+    Frame::new(t, fit(c, t, y), out, l.pick(["已保存的网络", "已儲存的網路", "Saved networks"]), top)
 }
 
 /// How long the screen stays on with nothing touched, opened from the
@@ -2882,6 +2981,15 @@ pub fn wlan(cx: &Ctx) -> Frame {
     let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).trail(Trail::Switch(on))]);
     out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
     let mut y = switch.bottom;
+    // The networks joined before, on a page of their own: they are kept
+    // whether or not the WLAN is on, so the page stands here.
+    let kept = format!("{}", s.saved_wlan.len());
+    let saved_row = Row::new(l.pick(["已保存的网络", "已儲存的網路", "Saved networks"]))
+        .icon(SLATE, Icon::Restore)
+        .trail(Trail::Value(&kept));
+    let saved_list = widgets::list(&mut c, t, f, y + t.m.card_gap + t.m.card_gap, &[saved_row]);
+    out.extend(hits(&saved_list.rows, &[Action::Open(Screen::SavedWlan)]));
+    y = saved_list.bottom;
     match &w.power {
         Power::Off => {
             let note = l.pick([
@@ -2919,6 +3027,32 @@ pub fn wlan(cx: &Ctx) -> Frame {
                         y = widgets::footnote(&mut c, t, f, y, &note);
                     }
                 }
+            }
+            // Wireless debugging: adbd takes the network beside the port,
+            // so a computer on the same network reaches the recovery
+            // without a cable. It stands under a heading of its own, kept
+            // apart from the networks above it.
+            let heading = l.pick(["调试", "偵錯", "Debugging"]);
+            y = widgets::section(&mut c, t, f, y, heading);
+            let adb_row = Row::new(l.pick(["无线调试", "無線偵錯", "Wireless debugging"])).icon(BLUE, Icon::Terminal).trail(Trail::Switch(s.wireless_adb));
+            let adb_list = widgets::list(&mut c, t, f, y, &[adb_row]);
+            out.extend(hits(&adb_list.rows, &[Action::Toggle(Switch::WirelessAdb)]));
+            y = adb_list.bottom;
+            if s.wireless_adb {
+                let address = w.joined.as_ref().and_then(|j| match &j.stage {
+                    Joining::Connected(link) => Some(link.address.to_string()),
+                    _ => None,
+                });
+                let note = match address {
+                    Some(address) => tr!(l, "在电脑上运行：adb connect {address}:5555", "在電腦上執行：adb connect {address}:5555", "On the computer: adb connect {address}:5555"),
+                    None => l.pick([
+                        "加入 WLAN 后，电脑在同一个网络里用 adb connect <手机 IP>:5555 连接。",
+                        "加入 Wi-Fi 後，電腦在同一個網路裡用 adb connect <手機 IP>:5555 連線。",
+                        "Once joined, a computer on the same network reaches it with adb connect <phone IP>:5555.",
+                    ])
+                    .to_string(),
+                };
+                y = widgets::footnote(&mut c, t, f, y, &note);
             }
             let others: Vec<(usize, &Network)> =
                 w.networks.iter().enumerate().filter(|(_, n)| w.joined.as_ref().is_none_or(|j| j.ssid != n.ssid)).collect();
@@ -3807,6 +3941,20 @@ pub fn fastboot(cx: &Ctx) -> Frame {
     let (t, f, s, i, l) = (cx.t, cx.f, cx.state, cx.info, cx.state.lang);
     let mut c = page(cx);
     let top = t.m.content_top;
+    // Handing over to the recovery's own pages mounts the slot's partitions
+    // again, which takes seconds: the page says so while it goes on.
+    if s.entering {
+        widgets::progress_card(
+            &mut c,
+            t,
+            f,
+            top,
+            l.pick(["正在进入恢复模式", "正在進入復原模式", "Entering the recovery"]),
+            l.pick(["正在切回 adb 并重新挂载分区…", "正在切回 adb 並重新掛載分割區…", "Handing the port back and mounting the partitions again…"]),
+            None,
+        );
+        return Frame { back: false, ..Frame::new(t, c, Vec::new(), "Fastboot", top) };
+    }
     let running = l.pick(if s.fastboot.running { ["正在运行", "正在執行", "Running"] } else { ["未运行", "未執行", "Not running"] });
     let link = l.pick(match s.fastboot.link {
         UsbLink::Connected => ["已连接电脑", "已連接電腦", "Computer connected"],

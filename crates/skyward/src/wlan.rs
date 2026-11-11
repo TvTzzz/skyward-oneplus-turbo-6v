@@ -39,8 +39,11 @@ const HOME: &str = "/skyward/run/supplicant";
 const WIFI: u32 = 1010;
 
 /// How long the driver may take to make its interface, the chip's firmware
-/// loading meanwhile.
-const INTERFACE_WAIT: Duration = Duration::from_secs(20);
+/// loading meanwhile. The OnePlus Turbo 6V's WCN6750 waits on its modem's
+/// data service for some fifteen seconds before it loads any firmware, and
+/// makes no interface until it has, so a minute covers the wait the phone's
+/// own system takes to bring its WLAN up.
+const INTERFACE_WAIT: Duration = Duration::from_secs(75);
 
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);

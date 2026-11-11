@@ -17,6 +17,7 @@ use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Power, Stage as WlanStage, Wlan};
 use skyward_vab::{Hold, Slot, SnapshotState, Standing};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -831,11 +832,35 @@ pub fn datetime(l: Lang, unix: i64, zone: usize) -> String {
     tr!(l, "{date} {clock}", "{date} {clock}", "{date}, {clock}")
 }
 
-/// The time of day in the zone at `zone` in [`TIME_ZONES`], `HH:MM`, as
-/// the status bar shows it.
+/// Whether the pages write the clock with a morning and an afternoon, 12
+/// hours twice, as the settings page chooses. Every page that writes a time
+/// of day reads this, so the status bar, the times under a backup and those
+/// in the file list agree.
+static HOURS12: AtomicBool = AtomicBool::new(false);
+
+/// Write the clock with a morning and an afternoon, or not.
+pub fn set_hours12(on: bool) {
+    HOURS12.store(on, Ordering::Relaxed);
+}
+
+fn hours12() -> bool {
+    HOURS12.load(Ordering::Relaxed)
+}
+
+/// The time of day in the zone at `zone` in [`TIME_ZONES`], `HH:MM`, or
+/// `H:MM AM` as the settings page chooses, as the status bar shows it.
 pub fn clock(unix: i64, zone: usize) -> String {
     let t = local(unix, zone);
-    format!("{:02}:{:02}", t.hour(), t.minute())
+    if !hours12() {
+        return format!("{:02}:{:02}", t.hour(), t.minute());
+    }
+    let (hour, after) = match t.hour() {
+        0 => (12, "AM"),
+        h @ 1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        h => (h - 12, "PM"),
+    };
+    format!("{hour}:{:02} {after}", t.minute())
 }
 
 /// A Unix time in the zone at `zone` in [`TIME_ZONES`], to the second, as

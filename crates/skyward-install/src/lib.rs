@@ -42,10 +42,27 @@ pub fn least_charge(charging: bool) -> u8 {
     }
 }
 
+/// Whether the pages said the charge need not be weighed before installing,
+/// for an owner who knows their phone's gauge.
+static SKIP_BATTERY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep the charge out of what installing waits for, or weigh it again.
+pub fn skip_battery_check(on: bool) {
+    SKIP_BATTERY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the charge is kept out of what installing waits for.
+pub fn skip_battery_check_on() -> bool {
+    SKIP_BATTERY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Why `battery` holds too little charge to install on, if it does. A
 /// charger is in while the battery charges, is full, or is held from
 /// charging.
 pub fn battery_refusal(battery: &Battery) -> Option<Refusal> {
+    if skip_battery_check_on() {
+        return None;
+    }
     let charging = matches!(battery.charge, Charge::Charging | Charge::Full | Charge::NotCharging);
     (battery.level < least_charge(charging)).then_some(Refusal::Battery { level: battery.level, charging })
 }
