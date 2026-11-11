@@ -1,6 +1,21 @@
 > **这是 [OnePlus Turbo 6V (PLY110 / OP64D3L1)](PORTING.md) 的移植分支。**
 > 移植细节、踩过的坑和已知限制都在 [PORTING.md](PORTING.md)。
 
+## 这个分支的界面
+
+<p align="center">
+  <img src="assets/screenshots/home.png" width="22%" alt="主页">
+  <img src="assets/screenshots/settings.png" width="22%" alt="设置">
+  <img src="assets/screenshots/wlan.png" width="22%" alt="WLAN">
+  <img src="assets/screenshots/install.png" width="22%" alt="安装">
+</p>
+<p align="center">
+  <img src="assets/screenshots/backup.png" width="22%" alt="备份">
+  <img src="assets/screenshots/files.png" width="22%" alt="文件管理">
+  <img src="assets/screenshots/settings-vibration.png" width="22%" alt="振动设置">
+  <img src="assets/screenshots/about.png" width="22%" alt="关于">
+</p>
+
 ![Skyward Recovery](assets/hero.jpg)
 
 # Skyward
