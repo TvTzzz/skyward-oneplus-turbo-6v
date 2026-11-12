@@ -450,6 +450,7 @@ fn held(m: &skyward_backup::Manifest) -> Held {
         made: m.made,
         size: m.size(),
         parts: m.parts(),
+        extra: m.items.iter().filter(|i| i.part == skyward_backup::Part::Other).map(|i| i.name.clone()).collect(),
         device: m.device.clone(),
         system: m.system.clone(),
         slot: skyward_vab::Slot::from_suffix(&m.slot),
@@ -1661,9 +1662,10 @@ pub fn run(
             surface.speed_up()?;
             rested_at = None;
         } else if surface.is_on() {
-            // With the backlight off, the panel rests, and the touch
-            // controller following it stops drawing power.
-            surface.rest()?;
+            // The panel is left as it is with the backlight off: a finger on
+            // the dark glass is to light it again, and a panel put to rest
+            // takes the touch controller with it, so nothing would come of
+            // that finger at all. What the rest saved is spent on answering.
             rested_at = Some(Instant::now());
         } else if rested_at.is_some_and(|at| at.elapsed() >= REST) {
             // Rested long enough, the display goes off: the panel and the
@@ -2697,6 +2699,7 @@ pub fn run(
                         let made = unix_now()?;
                         let task = backup::BackupTask {
                             parts,
+                            extra: app.state.extra_backup.clone(),
                             stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
                             into,
                             ownership,
@@ -2721,6 +2724,7 @@ pub fn run(
                         let task = backup::RestoreTask {
                             folder: backups_in(place).join(&name),
                             parts,
+                            extra: app.state.extra_restore.clone(),
                             device: cfg.device.codename.clone(),
                             skipped: backup::data_skipped(&cfg.backup.data_skipped),
                             detach: detach(cfg.services.clone()),
@@ -2762,6 +2766,12 @@ pub fn run(
                         wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
+                    // The partitions the phone has, for the pages that
+                    // pick which of them a backup takes.
+                    Effect::ListParts => {
+                        let parts = skyward_block::list_by_name(skyward_block::BY_NAME)?;
+                        app.parts_listed(parts.into_iter().map(|p| p.name).collect());
+                    }
                     // What the installed system is called is the page's to
                     // report when it cannot be read.
                     Effect::CheckUpdate => {

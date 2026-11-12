@@ -52,6 +52,8 @@ pub enum Screen {
     ScreenOff,
     /// How fast the panel refreshes, chosen from the rates it offers.
     Refresh,
+    /// Which partitions a backup takes besides the groups.
+    BackupParts,
     /// The networks kept, with their passwords, and whether the recovery
     /// joins them by itself.
     SavedWlan,
@@ -606,6 +608,8 @@ pub struct Held {
     pub size: u64,
     /// Which of [`BACKUP_PARTS`] it holds.
     pub parts: [bool; 4],
+    /// The partitions it holds beyond those groups, by name.
+    pub extra: Vec<String>,
     /// The phone it was made on, by its codename, the system it ran, as
     /// its version reads, and the slot it was made from.
     pub device: String,
@@ -1230,6 +1234,19 @@ pub enum Action {
     Refresh(u32),
     /// Forget the network kept at this place in the list of saved ones.
     ForgetWlan(usize),
+    /// Pick the partitions a backup takes, besides the groups.
+    OpenBackupParts,
+    /// Take the custom partitions, or leave them: the row that opens them
+    /// shows while they are taken.
+    ShowCustomParts,
+    /// Take or leave the partition at this place in the phone's list.
+    CustomPart(usize),
+    /// Take every partition the phone has, or leave them all.
+    SelectAllParts,
+    /// Take or leave the backup's own partition at this place.
+    RestoreCustomPart(usize),
+    /// Take every partition the backup holds of its own, or leave them all.
+    SelectAllRestoreParts,
     /// Keep the time zone at this place in [`TIME_ZONES`].
     TimeZone(usize),
     /// Speak this language.
@@ -1661,6 +1678,9 @@ pub struct State {
     pub pattern: Vec<usize>,
     /// How far the swipe-to-confirm knob is dragged, 0 to 1.
     pub confirm: f32,
+    /// Which slide that is: a page with two of them, as the restore page is,
+    /// moves only the one under the finger.
+    pub confirm_which: Option<Confirm>,
     pub install: Install,
     /// Where the package being installed comes from.
     pub source: Source,
@@ -1692,6 +1712,15 @@ pub struct State {
     pub verify: bool,
     /// The backups found, newest first, those that cannot be read last.
     pub backups: Vec<BackupEntry>,
+    /// Every partition the phone has, by name, for the pages that pick them.
+    pub all_parts: Vec<String>,
+    /// The partitions picked to go into a backup, by name.
+    pub extra_backup: Vec<String>,
+    /// The backup's own partitions picked to restore, by name.
+    pub extra_restore: Vec<String>,
+    /// The custom partitions are taken: the row that opens them shows under
+    /// their own.
+    pub show_custom: bool,
     /// The backup the restore page shows, as it was found, and which of its
     /// parts to restore.
     pub restore: Option<(BackupEntry, [bool; 4])>,
@@ -1837,6 +1866,7 @@ impl Default for State {
             phone_logs: 0,
             pattern: Vec::new(),
             confirm: 0.0,
+            confirm_which: None,
             install: Install::Idle,
             source: Source::Computer,
             package_name: None,
@@ -1852,6 +1882,10 @@ impl Default for State {
             compress: false,
             verify: true,
             backups: Vec::new(),
+            all_parts: Vec::new(),
+            extra_backup: Vec::new(),
+            extra_restore: Vec::new(),
+            show_custom: false,
             restore: None,
             backup_job: None,
             logs: [true, true],
@@ -2034,6 +2068,8 @@ pub enum Effect {
     WirelessAdb(bool),
     /// Keep the credential the pages' next unlock uses, or forget it.
     Credential(Option<Vec<u8>>),
+    /// List the partitions the phone has, for the pages that pick them.
+    ListParts,
     /// The owner agreed to keep the credential: the pages ask for it once
     /// more, to be sure it opens their files.
     EnableAutoDecrypt,
@@ -2365,6 +2401,10 @@ const REPEAT_MS: u64 = 50;
 /// take a screenshot, as the system's key combination does; the first of
 /// the two waits this long, or until it is let go, before it does what it
 /// does alone.
+/// How long a lock left alone stays lit before the panel goes dark again,
+/// in milliseconds.
+const LOCK_OFF: u64 = 7_000;
+
 const CHORD_MS: u64 = 150;
 /// How far along its track the knob of a swipe-to-confirm control has to
 /// be let go to confirm.
@@ -2743,6 +2783,13 @@ pub struct App {
     /// while other pages show.
     term: Option<Term>,
     display_on: bool,
+    /// The pages are behind a lock until a slide up lets them show: what a
+    /// lit panel shows first.
+    locked: bool,
+    /// Where the finger that may unlock them came down, and how far it has
+    /// gone up since.
+    unlock_from: Option<f32>,
+    unlock_share: f32,
     /// When the screen was last touched or a key pressed; set on the first
     /// tick, so the time before the UI started does not count.
     active: Option<u64>,
@@ -2842,6 +2889,9 @@ impl App {
             glow: None,
             term: None,
             display_on: true,
+            locked: false,
+            unlock_from: None,
+            unlock_share: 0.0,
             active: None,
             woke_at: None,
             bright: full_brightness(),
@@ -3010,7 +3060,13 @@ impl App {
             }
         }
         let active = *self.active.get_or_insert(now);
-        if let (true, Some(after)) = (self.display_on && !self.stays_lit(), SCREEN_OFF[self.state.screen_off]) {
+        // A lock left alone goes dark again after a few seconds of its own,
+        // whatever the screen-off setting says.
+        let after = match self.locked {
+            true => Some(LOCK_OFF),
+            false => SCREEN_OFF[self.state.screen_off],
+        };
+        if let (true, Some(after)) = (self.display_on && !self.stays_lit(), after) {
             let idle = now.saturating_sub(active);
             if idle >= after {
                 self.sleep(now);
@@ -3208,6 +3264,11 @@ impl App {
     fn wake(&mut self, now: u64) {
         if !self.display_on {
             self.display_on = true;
+            // A panel lit from dark shows the lock, and the pages wait
+            // behind it for the slide up.
+            self.locked = true;
+            self.unlock_share = 0.0;
+            self.unlock_from = None;
             self.dirty = true;
             self.darkening = None;
             self.curtain.set(true, now);
@@ -3407,6 +3468,13 @@ impl App {
 
     /// Fastboot has stopped and the recovery is up: its pages start again
     /// from the home page, which nothing can go back from to fastboot.
+    /// The partitions the phone has, by name, as the pages that pick them
+    /// show them.
+    pub fn parts_listed(&mut self, names: Vec<String>) {
+        self.state.all_parts = names;
+        self.refresh();
+    }
+
     /// A network the pages just joined is kept, with the password it was
     /// joined with, so the next start joins it without asking.
     pub fn remember_wlan(&mut self, name: &str, password: &str, security: Security) {
@@ -4363,6 +4431,11 @@ impl App {
     /// while a cable has just gone in, both as dark as the content stands
     /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        if self.locked {
+            self.compose_lock(out, f, info, clock);
+            out.dim(self.curtain.level(now));
+            return;
+        }
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
             self.compose_page(out, f, info, clock, now);
@@ -4371,6 +4444,40 @@ impl App {
             self.compose_charging(out, f, info, charge, now);
         }
         out.dim(self.curtain.level(now));
+    }
+
+    /// The lock the pages wait behind: the clock, the battery under it, and
+    /// the slide up that lets them show, all on a dark panel.
+    fn compose_lock(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str) {
+        let lang = self.state.lang;
+        let (w, h) = (out.w as f32, out.h as f32);
+        out.fill_rect(0.0, 0.0, w, h, Rgba::rgb(0, 0, 0));
+        // The time, large and in the middle, kept within the panel.
+        let mut px = (w * 0.19).round();
+        let mut width = out.text_width(&f.title, clock, px);
+        if width > w * 0.82 {
+            px *= (w * 0.82) / width;
+            width = out.text_width(&f.title, clock, px);
+        }
+        let base = (h * 0.44).round();
+        out.text(&f.title, clock, ((w - width) / 2.0).round(), base, px, Rgba::rgb(0xf2, 0xf2, 0xf5), Some(w));
+        // The share it stands at, under it.
+        if let Some(battery) = &info.battery {
+            let text = format!("{}%", battery.level);
+            let small = (w * 0.052).round();
+            let width = out.text_width(&f.body, &text, small);
+            out.text(&f.body, &text, ((w - width) / 2.0).round(), (base + px * 0.62).round(), small, Rgba::rgb(0x9a, 0x9a, 0xa2), Some(w));
+        }
+        // The slide up, and the bar that says where it is.
+        let rise = self.unlock_share * h * 0.10;
+        let hint = lang.pick(["上滑解锁", "上滑解鎖", "Slide up to unlock"]);
+        let small = (w * 0.04).round();
+        let width = out.text_width(&f.body, hint, small);
+        out.text(&f.body, hint, ((w - width) / 2.0).round(), (h * 0.86 - rise).round(), small, Rgba::rgb(0x6a, 0x6a, 0x72), Some(w));
+        let (bar_w, bar_h) = (w * 0.24, (h * 0.005).max(3.0));
+        let left = (w - bar_w) / 2.0;
+        let top = h * 0.983 - rise * 0.6;
+        out.fill_round_rect(left, top, bar_w, bar_h, bar_h / 2.0, Rgba::rgb(0xf2, 0xf2, 0xf5));
     }
 
     /// The charging screen, `level` of the way over the page drawn on `out`.
@@ -5550,9 +5657,69 @@ impl App {
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
                 let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                self.state.extra_restore = entry.held.as_ref().map_or(Vec::new(), |h| h.extra.clone());
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
+            }
+            // The row that opens the custom partitions shows once they are
+            // taken, which is what its mark says.
+            Action::ShowCustomParts => {
+                self.state.show_custom = !self.state.show_custom;
+                if !self.state.show_custom {
+                    self.state.extra_backup.clear();
+                }
+                self.refresh();
+            }
+            // The partitions the phone has, for the pages that pick them.
+            Action::OpenBackupParts => {
+                self.open(Screen::BackupParts);
+                let mut fx = self.arrive_at(Screen::BackupParts);
+                if self.state.all_parts.is_empty() {
+                    fx.push(Effect::ListParts);
+                }
+                return fx;
+            }
+            Action::CustomPart(i) => {
+                if let Some(name) = self.state.all_parts.get(i).cloned() {
+                    match self.state.extra_backup.iter().position(|n| *n == name) {
+                        Some(at) => {
+                            self.state.extra_backup.remove(at);
+                        }
+                        None => self.state.extra_backup.push(name),
+                    }
+                    self.refresh();
+                }
+            }
+            Action::SelectAllParts => {
+                let all = self.state.all_parts.iter().all(|n| self.state.extra_backup.contains(n)) && !self.state.all_parts.is_empty();
+                if all {
+                    self.state.extra_backup.clear();
+                } else {
+                    self.state.extra_backup = self.state.all_parts.clone();
+                }
+                self.refresh();
+            }
+            Action::RestoreCustomPart(i) => {
+                let name = self.state.restore.as_ref().and_then(|(entry, _)| entry.held.as_ref().ok()).and_then(|h| h.extra.get(i).cloned());
+                if let Some(name) = name {
+                    match self.state.extra_restore.iter().position(|n| *n == name) {
+                        Some(at) => {
+                            self.state.extra_restore.remove(at);
+                        }
+                        None => self.state.extra_restore.push(name),
+                    }
+                    self.refresh();
+                }
+            }
+            Action::SelectAllRestoreParts => {
+                let all: Vec<String> = self.state.restore.as_ref().and_then(|(entry, _)| entry.held.as_ref().ok()).map(|h| h.extra.clone()).unwrap_or_default();
+                if !all.is_empty() && all.iter().all(|n| self.state.extra_restore.contains(n)) {
+                    self.state.extra_restore.clear();
+                } else {
+                    self.state.extra_restore = all;
+                }
+                self.refresh();
             }
             Action::RestorePart(k) => {
                 let (_, parts) = self.state.restore.as_mut().expect("the restore page shows a backup");
@@ -6134,9 +6301,40 @@ impl App {
     }
 
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
-        // A finger on the dark panel lights nothing, as on the phone's own
-        // system, where the power key lights it.
+        // A finger on the dark panel lights it, and the lock it shows waits
+        // for the slide up the finger may already be making.
         if !self.display_on {
+            if let Touch::Down(_, y) = ev {
+                self.wake(now);
+                self.unlock_from = Some(y);
+                self.unlock_share = 0.0;
+            }
+            return Vec::new();
+        }
+        // Behind the lock nothing else answers.
+        if self.locked {
+            let height = self.h as f32;
+            match ev {
+                Touch::Down(_, y) => {
+                    self.unlock_from = Some(y);
+                    self.unlock_share = 0.0;
+                    self.stir(now);
+                }
+                Touch::Move(_, y) => {
+                    let from = self.unlock_from.unwrap_or(y);
+                    self.unlock_share = ((from - y) / (height * 0.45)).clamp(0.0, 1.0);
+                    self.stir(now);
+                    self.dirty = true;
+                }
+                Touch::Up => {
+                    if self.unlock_share >= 1.0 {
+                        self.locked = false;
+                        self.dirty = true;
+                    }
+                    self.unlock_share = 0.0;
+                    self.unlock_from = None;
+                }
+            }
             return Vec::new();
         }
         // A finger on the charging screen sends it away for the page, and
@@ -6248,6 +6446,7 @@ impl App {
                     }
                     Some((Action::Confirm(which), track)) if self.on_knob(track, x) => {
                         let knob_x = track.x + (track.w - track.h) * self.state.confirm;
+                        self.state.confirm_which = Some(which);
                         Drag::Confirm { which, track, grab: x - knob_x }
                     }
                     Some((Action::Pattern, _)) => {
@@ -6399,6 +6598,7 @@ impl App {
                 Drag::Confirm { which, track, .. } => {
                     let done = self.state.confirm > SLID;
                     self.state.confirm = 0.0;
+                    self.state.confirm_which = None;
                     self.repaint_confirm(&t, f, which, track);
                     if done {
                         fx.extend(self.confirmed(which, now));
@@ -6656,7 +6856,7 @@ impl App {
             }
             Confirm::Backup => {
                 let s = &self.state;
-                let refused = if !s.backup.contains(&true) {
+                let refused = if !s.backup.contains(&true) && s.extra_backup.is_empty() {
                     Some(["请选择要备份的内容", "請選擇要備份的內容", "Choose what to back up"])
                 } else if s.backup[2] && s.data != Data::Open {
                     Some(["备份 data 分区需先完成「解密」", "備份 data 分割區需先完成「解密」", "Decrypt before backing up the data partition"])

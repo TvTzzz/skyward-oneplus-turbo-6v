@@ -5,7 +5,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
 /// Where GitHub answers which release of Skyward is the newest.
-pub const LATEST: &str = "https://api.github.com/repos/kirklin/skyward/releases/latest";
+pub const LATEST: &str = "https://api.github.com/repos/TvTzzz/skyward-oneplus-turbo-6v/releases/latest";
 
 /// The version of GitHub's API the answer is read as.
 const API_VERSION: &str = "2022-11-28";
@@ -78,9 +78,9 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
     let version = tag.strip_prefix('v').with_context(|| format!("the newest release is tagged {tag}, which is not v and a version"))?;
     let newest = semver::Version::parse(version).with_context(|| format!("the newest release is tagged {tag}"))?;
     let this = semver::Version::parse(running).with_context(|| format!("this build's version is {running}"))?;
-    // Each zip is named skyward-, the tag, the phone's codename, and the
-    // stock build the image is made on.
-    let start = format!("skyward-{tag}-{codename}-");
+    // Each zip is named skyward-, the tag, and the phone's codename; what
+    // follows the codename is the maker's own.
+    let start = format!("skyward-{tag}-{codename}");
     let build = match release.assets.into_iter().find(|a| a.name.starts_with(&start) && a.name.ends_with(".zip")) {
         None => None,
         Some(a) => {

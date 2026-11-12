@@ -77,6 +77,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Refresh => refresh(cx),
         Screen::Search => search(cx),
         Screen::Backup => backup(cx),
+        Screen::BackupParts => backup_parts(cx),
         Screen::Restore => restore(cx),
         Screen::RestoreBackup => restore_backup(cx),
         Screen::BackupJob => backup_job(cx),
@@ -1903,6 +1904,42 @@ pub fn search(cx: &Ctx) -> Frame {
 }
 
 /// Backing up: what to take, where it goes, and how.
+/// The partitions the phone has, which a backup may take besides the
+/// groups: each taken or left, all of them at the section's right.
+pub fn backup_parts(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    // A page as tall as the partitions it lists: the longest of these has
+    // more rows than three screens hold.
+    let rows_n = s.all_parts.len().max(4) as f32;
+    let tall = (t.m.content_top + rows_n * (t.m.row_h + t.m.row_pad_v * 2.0) + t.m.margin * 6.0).ceil() as u32;
+    let mut c = sheet(cx, tall.max(t.m.h * 3), t.pal.bg);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(["自定义分区", "自訂分割區", "Custom partitions"]);
+    if s.all_parts.is_empty() {
+        let note = l.pick(["正在读取分区…", "正在讀取分割區…", "Reading the partitions…"]);
+        let y = widgets::footnote(&mut c, t, f, top, note);
+        return Frame::new(t, fit(c, t, y), out, title, top);
+    }
+    let (y, all) = widgets::section_action(&mut c, t, f, top, l.pick(["分区", "分割區", "Partitions"]), l.pick(["全选", "全選", "Select all"]));
+    out.push(Hit { rect: all, action: Action::SelectAllParts });
+    let rows: Vec<Row> = s
+        .all_parts
+        .iter()
+        .map(|n| Row::new(n).trail(Trail::Check(s.extra_backup.contains(n))))
+        .collect();
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    let picks: Vec<Action> = (0..s.all_parts.len()).map(Action::CustomPart).collect();
+    out.extend(hits(&list.rows, &picks));
+    let note = l.pick([
+        "选中的分区会以镜像形式跟四组内容一起备份，恢复时可以单独挑出其中几个。",
+        "選中的分割區會以映像形式跟四組內容一起備份，還原時可以單獨挑出其中幾個。",
+        "The partitions chosen are stored as images beside the four groups, and may be restored one by one.",
+    ]);
+    let y = widgets::footnote(&mut c, t, f, list.bottom, note);
+    Frame::new(t, fit(c, t, y), out, title, top)
+}
+
 pub fn backup(cx: &Ctx) -> Frame {
     let (t, f, s, i, l) = (cx.t, cx.f, cx.state, cx.info, cx.state.lang);
     let mut c = long_page(cx);
@@ -1921,14 +1958,37 @@ pub fn backup(cx: &Ctx) -> Frame {
     let boot = l.pick(["boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot、init_boot、vendor_boot、dtbo、vbmeta 和 recovery", "boot, init_boot, vendor_boot, dtbo, vbmeta and recovery"]);
     let modem = l.pick(["IMEI、基带设置和传感器校准数据", "IMEI、基頻設定和感應器校正資料", "IMEI, modem settings and sensor calibration"]);
     let subs = [boot, system, data, modem];
-    let rows: Vec<Row> = BACKUP_PARTS
+    let mut rows: Vec<Row> = BACKUP_PARTS
         .iter()
         .zip(subs)
         .enumerate()
         .map(|(k, (name, sub))| Row::new(l.pick(*name)).subtitle(sub).trail(Trail::Check(s.backup[k])))
         .collect();
+    // A button in the group, like the four above it; what it opens shows
+    // only once it has been pressed.
+    // The fifth row is the four above it, down to the mark on its right;
+    // taken, it puts the row that opens the partitions under it.
+    rows.push(
+        Row::new(l.pick(["自定义分区", "自訂分割區", "Custom partitions"]))
+            .subtitle(l.pick(["按名字挑选要一起备份的分区", "按名稱挑選要一起備份的分割區", "Pick partitions by name to take too"]))
+            .trail(Trail::Check(s.show_custom)),
+    );
+    let picked = s.extra_backup.len();
+    let open = match (s.show_custom, picked) {
+        (true, 0) => l.pick(["＋ 自定义分区", "＋ 自訂分割區", "＋ Custom partitions"]).to_string(),
+        (true, n) => tr!(l, "＋ 自定义分区（已选 {n} 个）", "＋ 自訂分割區（已選 {n} 個）", "＋ Custom partitions ({n} chosen)"),
+        (false, _) => String::new(),
+    };
+    if s.show_custom {
+        rows.push(Row::new(&open).trail(Trail::Arrow));
+    }
     let parts = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&parts.rows, &[0, 1, 2, 3].map(Action::BackupPart)));
+    let (groups, rest) = parts.rows.split_at(4);
+    out.extend(hits(groups, &[0, 1, 2, 3].map(Action::BackupPart)));
+    out.extend(hits(&rest[..1], &[Action::ShowCustomParts]));
+    if rest.len() > 1 {
+        out.extend(hits(&rest[1..], &[Action::OpenBackupParts]));
+    }
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["存放位置", "存放位置", "Save to"]));
     let storage = match (s.data.storage_open(), i.storage.free.map(fmt::gb)) {
         (true, Some(free)) => tr!(l, "剩余 {free}", "剩餘 {free}", "{free} free"),
@@ -1959,7 +2019,8 @@ pub fn backup(cx: &Ctx) -> Frame {
     ]);
     let y = widgets::footnote(&mut c, t, f, options.bottom, note);
     let (label, danger) = confirm_label(Confirm::Backup, cx.state);
-    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+    let share = if s.confirm_which == Some(Confirm::Backup) { s.confirm } else { 0.0 };
+    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, share);
     out.push(Hit { rect: track, action: Action::Confirm(Confirm::Backup) });
     Frame::new(t, fit(c, t, track.y + track.h), out, l.pick(["备份", "備份", "Backup"]), top)
 }
@@ -1979,7 +2040,19 @@ pub fn restore(cx: &Ctx) -> Frame {
             .backups
             .iter()
             .map(|b| match &b.held {
-                Ok(h) => (fmt::datetime(l, h.made, s.time_zone), format!("{} · {} · {}", fmt::parts(l, &h.parts), fmt::bytes(h.size), place_name(l, b.place))),
+                Ok(h) => {
+                    // The partitions kept by name stand with the groups, so
+                    // the line says a backup holds some of them too.
+                    let held = match h.extra.is_empty() {
+                        true => fmt::parts(l, &h.parts),
+                        false => {
+                            let n = h.extra.len();
+                            let name = tr!(l, "自定义分区({n}个)", "自訂分割區({n}個)", "custom partitions ({n})");
+                            format!("{}、{name}", fmt::parts(l, &h.parts))
+                        }
+                    };
+                    (fmt::datetime(l, h.made, s.time_zone), format!("{held} · {} · {}", fmt::bytes(h.size), place_name(l, b.place)))
+                }
                 Err(_) => (b.name.clone(), format!("{} · {}", l.pick(UNREADABLE), place_name(l, b.place))),
             })
             .collect();
@@ -2003,7 +2076,9 @@ pub fn restore(cx: &Ctx) -> Frame {
 pub fn restore_backup(cx: &Ctx) -> Frame {
     let (t, f, s, i, l) = (cx.t, cx.f, cx.state, cx.info, cx.state.lang);
     let (entry, chosen) = s.restore.as_ref().expect("the restore page shows a backup");
-    let mut c = long_page(cx);
+    let rows_n = entry.held.as_ref().map_or(0, |h| h.extra.len()).max(4) as f32;
+    let tall = (t.m.content_top + rows_n * (t.m.row_h + t.m.row_pad_v * 2.0) + t.m.margin * 10.0).ceil() as u32;
+    let mut c = sheet(cx, tall.max(t.m.h * 3), t.pal.bg);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let location = l.pick(["位置", "位置", "Location"]);
@@ -2047,8 +2122,25 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                 let rows: Vec<Row> = kept.iter().map(|&k| Row::new(l.pick(BACKUP_PARTS[k])).trail(Trail::Check(chosen[k]))).collect();
                 let list = widgets::list(&mut c, t, f, y, &rows);
                 out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
+                let mut after = list.bottom;
+                if !held.extra.is_empty() {
+                    let (below, all) = widgets::section_action(
+                        &mut c,
+                        t,
+                        f,
+                        after,
+                        l.pick(["自定义分区", "自訂分割區", "Custom partitions"]),
+                        l.pick(["全选", "全選", "Select all"]),
+                    );
+                    out.push(Hit { rect: all, action: Action::SelectAllRestoreParts });
+                    let rows: Vec<Row> = held.extra.iter().map(|n| Row::new(n).trail(Trail::Check(s.extra_restore.contains(n)))).collect();
+                    let custom = widgets::list(&mut c, t, f, below, &rows);
+                    let picks: Vec<Action> = (0..held.extra.len()).map(Action::RestoreCustomPart).collect();
+                    out.extend(hits(&custom.rows, &picks));
+                    after = custom.bottom;
+                }
                 let note = l.pick(["恢复后，所选内容的现有数据将被备份覆盖。", "還原後，所選內容的現有資料將被備份覆寫。", "Restoring writes the backup over what the parts chosen hold now."]);
-                let mut y = widgets::footnote(&mut c, t, f, list.bottom, note);
+                let mut y = widgets::footnote(&mut c, t, f, after, note);
                 if chosen[2] {
                     let note = l.pick([
                         "data 分区将恢复应用、账户和设置，内部存储、锁屏密码和指纹保持不变。恢复出厂设置后，无法再恢复此前的 data 分区备份。",
@@ -2071,7 +2163,8 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                     }
                 }
                 let (label, danger) = confirm_label(Confirm::Restore, cx.state);
-                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+                let share = if s.confirm_which == Some(Confirm::Restore) { s.confirm } else { 0.0 };
+                let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, share);
                 out.push(Hit { rect: track, action: Action::Confirm(Confirm::Restore) });
                 track.y + track.h
             }
@@ -2084,7 +2177,8 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
         let ask = l.pick(["删除该备份？删除后无法恢复。", "刪除這份備份？刪除後無法復原。", "Delete this backup? It can't be brought back."]);
         let y = widgets::footnote(&mut c, t, f, delete.bottom, ask);
         let (label, danger) = confirm_label(Confirm::DeleteBackup, cx.state);
-        let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+        let share = if s.confirm_which == Some(Confirm::DeleteBackup) { s.confirm } else { 0.0 };
+        let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, share);
         out.push(Hit { rect: track, action: Action::Confirm(Confirm::DeleteBackup) });
         bottom = track.y + track.h;
     }

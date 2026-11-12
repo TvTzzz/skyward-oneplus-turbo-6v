@@ -55,8 +55,15 @@ fn question(xid: u32, mac: [u8; 6], kind: MessageType, broadcast: bool, ciaddr: 
     }
     m.opts_mut().insert(DhcpOption::MessageType(kind));
     m.opts_mut().insert(DhcpOption::ParameterRequestList(ASKED.to_vec()));
+    // The name the router shows for this phone where it lists what is
+    // joined to it, which is otherwise nothing at all.
+    m.opts_mut().insert(DhcpOption::Hostname(HOSTNAME.to_string()));
     m
 }
+
+/// The name the router knows this phone by, sent with each question it is
+/// asked: `Skyward`, which is what the recovery is.
+const HOSTNAME: &str = "Skyward";
 
 fn bytes(m: &Message) -> Result<Vec<u8>> {
     m.to_vec().context("put a DHCP message together")

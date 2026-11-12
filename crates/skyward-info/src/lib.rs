@@ -19,6 +19,7 @@ const POWER_SUPPLY: &str = "/sys/class/power_supply";
 /// Where the power management chip's converters answer, for a phone whose
 /// battery has no power supply of its own.
 const IIO: &str = "/sys/bus/iio/devices";
+const THERMAL: &str = "/sys/class/thermal";
 const SYS_BLOCK: &str = "/sys/class/block";
 
 /// What the recovery shows about the device. A source that may legitimately
@@ -366,7 +367,9 @@ fn adc_battery() -> Result<Option<Battery>> {
     let Some(voltage) = adc_voltage()? else { return Ok(None) };
     // The power management chip answers for the current coming in as well,
     // which is what says a charger is in: nothing of the phone's own charger
-    // framework runs in the recovery.
+    // framework runs in the recovery. Near a full battery that current falls
+    // to nothing as the charger tapers, so a reading under the threshold may
+    // be either a charger still in or none at all.
     let incoming = adc_incoming().unwrap_or(0);
     let plugged = plugged_now(incoming);
     // A charger holds the cell's terminals above their resting voltage, so
@@ -376,7 +379,7 @@ fn adc_battery() -> Result<Option<Battery>> {
     Ok(Some(Battery {
         level: settle_level(level_from_voltage(settle(resting)), plugged),
         charge: if plugged { Charge::Charging } else { Charge::Unknown },
-        temp: None,
+        temp: adc_temperature().ok().flatten(),
         health: None,
         cycles: None,
         design: None,
@@ -387,18 +390,39 @@ fn adc_battery() -> Result<Option<Battery>> {
     }))
 }
 
+/// The battery's temperature in tenths of a degree Celsius, from the thermal
+/// zone the kernel names for it; `None` where there is none.
+fn adc_temperature() -> Result<Option<i32>> {
+    let zones = match fs::read_dir(THERMAL) {
+        Ok(zones) => zones,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {THERMAL}")),
+    };
+    for zone in zones.flatten() {
+        let path = zone.path();
+        let Ok(name) = fs::read_to_string(path.join("type")) else { continue };
+        let name = name.trim();
+        // The cell's own sensor, not the charger's or the board's.
+        if !(name.starts_with("batt") && !name.contains("conn")) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path.join("temp")) else { continue };
+        let Ok(milli) = text.trim().parse::<i32>() else { continue };
+        if (-400_000..=1_200_000).contains(&milli) {
+            return Ok(Some(milli / 100));
+        }
+    }
+    Ok(None)
+}
+
 /// The voltage the readings have settled at, so a cell's terminal voltage
-/// moving by tens of millivolts as the charger works does not make the share
-/// jump: the curve is steep enough there that ten millivolts is a point.
+/// moving by tens of millivolts while the pages read does not make the
+/// share jump: the curve is steep enough there that ten millivolts is a
+/// point.
 static SETTLED_UV: AtomicU64 = AtomicU64::new(0);
 
-/// The share last shown, so it only moves the way the battery does: up on a
-/// charger, down off one. A charger's going away takes its lift out of the
-/// curve, which would otherwise read as the battery gaining charge.
-static LAST_SHOWN: AtomicU8 = AtomicU8::new(0);
-
-/// `uv` followed slowly by the share the pages show, a twentieth of each
-/// reading at a time, some twenty seconds to follow a real change.
+/// `uv` followed slowly by the share the pages show, a fiftieth of each
+/// reading at a time, some fifty seconds to follow a real change.
 fn settle(uv: u64) -> u64 {
     let old = SETTLED_UV.load(Ordering::Relaxed);
     if old == 0 {
@@ -409,6 +433,40 @@ fn settle(uv: u64) -> u64 {
     SETTLED_UV.store(next, Ordering::Relaxed);
     next
 }
+
+/// The battery's voltage in microvolts, from the power management chip's
+/// converter, as `/sys/bus/iio/devices` names it. A rail that is off reads
+/// absurdly low or high, so only a cell's own range is taken.
+fn adc_voltage() -> Result<Option<u64>> {
+    let root = Path::new(IIO);
+    let devices = match fs::read_dir(root) {
+        Ok(devices) => devices,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", root.display())),
+    };
+    for device in devices {
+        let device = device?.path();
+        let Ok(channels) = fs::read_dir(&device) else { continue };
+        for channel in channels.flatten() {
+            let name = channel.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("in_voltage_") || !name.ends_with("vbat_sns_qbg_input") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(channel.path()) else { continue };
+            let Ok(uv) = text.trim().parse::<u64>() else { continue };
+            if (2_500_000..=5_000_000).contains(&uv) {
+                return Ok(Some(uv));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The share last shown, so it only moves the way the battery does: up on a
+/// charger, down off one. A charger's going away takes its lift out of the
+/// curve, which would otherwise read as the battery gaining charge.
+static LAST_SHOWN: AtomicU8 = AtomicU8::new(0);
 
 /// `level` as the pages may show it: on a charger the share only rises, off
 /// one it only falls.
@@ -445,35 +503,6 @@ fn adc_incoming() -> Result<u64> {
         }
     }
     Ok(0)
-}
-
-/// The battery's voltage in microvolts, from the power management chip's
-/// converter, as `/sys/bus/iio/devices` names it. A rail that is off reads
-/// absurdly low or high, so only a cell's own range is taken.
-fn adc_voltage() -> Result<Option<u64>> {
-    let root = Path::new(IIO);
-    let devices = match fs::read_dir(root) {
-        Ok(devices) => devices,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {}", root.display())),
-    };
-    for device in devices {
-        let device = device?.path();
-        let Ok(channels) = fs::read_dir(&device) else { continue };
-        for channel in channels.flatten() {
-            let name = channel.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("in_voltage_") || !name.ends_with("vbat_sns_qbg_input") {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(channel.path()) else { continue };
-            let Ok(uv) = text.trim().parse::<u64>() else { continue };
-            if (2_500_000..=5_000_000).contains(&uv) {
-                return Ok(Some(uv));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// The current coming in that says a charger went in, in microamperes: a

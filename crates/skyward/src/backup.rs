@@ -85,6 +85,8 @@ pub fn data_skipped(phone: &[String]) -> Vec<String> {
 pub struct BackupTask {
     /// Which of [`Part::ALL`] to take.
     pub parts: [bool; 4],
+    /// Partitions the owner picked by name, beyond those groups.
+    pub extra: Vec<String>,
     /// The folder of backups at the place chosen; this one goes into a
     /// folder of its own there, called `stamp`.
     pub into: PathBuf,
@@ -110,6 +112,8 @@ pub struct RestoreTask {
     pub folder: PathBuf,
     /// Which of [`Part::ALL`] to restore.
     pub parts: [bool; 4],
+    /// The backup's other partitions to restore, by name.
+    pub extra: Vec<String>,
     pub device: String,
     pub skipped: Vec<String>,
     /// What has to happen before the slot's partitions in super are written
@@ -386,6 +390,12 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
             plan.push((Part::Efs, name.clone(), Source::Block(device), size));
         }
     }
+    for name in &t.extra {
+        let device = partition(name);
+        ensure!(device.exists(), "the phone has no partition {name}");
+        let size = skyward_block::size_bytes(&device)?;
+        plan.push((Part::Other, name.clone(), Source::Block(device), size));
+    }
     // Compressed, what the files take is not known until they are written.
     needed += plan.iter().map(|p| p.3).sum::<u64>();
     let free = free_bytes(&t.into)?;
@@ -497,9 +507,16 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
         return Err(Refusal::OtherPhone(manifest.device).into());
     }
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-    let mut items: Vec<&Item> = manifest.items.iter().filter(|i| t.parts[index(i.part)]).collect();
+    let mut items: Vec<&Item> = manifest
+        .items
+        .iter()
+        .filter(|i| match i.part {
+            Part::Other => t.extra.iter().any(|name| *name == i.name),
+            part => t.parts[index(part)],
+        })
+        .collect();
     ensure!(!items.is_empty(), "nothing chosen to restore is in the backup");
-    items.sort_by_key(|i| RESTORE_ORDER.iter().position(|&p| p == i.part));
+    items.sort_by_key(|i| RESTORE_ORDER.iter().position(|&p| p == i.part).unwrap_or(RESTORE_ORDER.len()));
     // All that can be seen before anything is written.
     let system = items.iter().any(|i| i.part == Part::System);
     if system || items.iter().any(|i| i.part == Part::Boot) {
@@ -508,7 +525,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
     let sizes = if system { skyward_vab::slot_sizes(slot)? } else { Vec::new() };
     for item in &items {
         match item.part {
-            Part::Boot | Part::Efs => {
+            Part::Boot | Part::Efs | Part::Other => {
                 let device = target(item, slot);
                 ensure!(device.exists(), "the phone has no partition {}", device.display());
                 let size = skyward_block::size_bytes(&device)?;
@@ -554,7 +571,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
     let mut unmade = Vec::new();
     for (k, item) in items.iter().enumerate() {
         match item.part {
-            Part::Boot | Part::Efs => {
+            Part::Boot | Part::Efs | Part::Other => {
                 let mut telling = Telling::new(tell, k, item.stored.size * 2, false);
                 write_image(&target(item, slot), &t.folder, &item.stored, &mut telling)?;
             }
@@ -586,7 +603,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
 /// The partition a part of a backup goes back to.
 fn target(item: &Item, slot: Slot) -> PathBuf {
     match item.part {
-        Part::Efs => partition(&item.name),
+        Part::Efs | Part::Other => partition(&item.name),
         _ => partition(&format!("{}{}", item.name, slot.suffix())),
     }
 }

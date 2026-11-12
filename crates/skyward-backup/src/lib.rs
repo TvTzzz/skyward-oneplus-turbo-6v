@@ -34,6 +34,9 @@ pub enum Part {
     /// The baseband's settings with the phone's own identity, and the
     /// sensors' calibration.
     Efs,
+    /// A partition the owner picked by its own name, apart from the four
+    /// groups above.
+    Other,
 }
 
 impl Part {
