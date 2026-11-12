@@ -2737,6 +2737,36 @@ const ACTIONS: Text = ["操作", "操作", "Actions"];
 /// where an update the system installed stands, merging it into the slot it
 /// went to: how far a merge under way has come, and a swipe to merge one
 /// that waits there for the system to start it.
+/// What a release was published with, as GitHub gives it in Markdown: each
+/// line as it stands, with the marks that mostly decorate them taken out.
+fn release_notes(c: &mut Canvas, t: &Theme, f: &Fonts, mut y: f32, body: &str) -> f32 {
+    let mut fenced = false;
+    for line in body.lines() {
+        let text = line.trim();
+        if text.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if text.is_empty() {
+            y += t.m.dp(6.0);
+            continue;
+        }
+        // Headings, bullets and quote marks say nothing once every line is
+        // a line of plain words.
+        let text = text
+            .trim_start_matches('#')
+            .trim_start_matches('>')
+            .trim();
+        let text = match (fenced, text.strip_prefix("- ").or_else(|| text.strip_prefix("* "))) {
+            (false, Some(rest)) => format!("· {}", rest.trim_start_matches('[').trim()),
+            _ => text.to_string(),
+        };
+        let text = text.trim_start_matches("**").replace("**", "");
+        y = widgets::footnote(c, t, f, y, &text);
+    }
+    y
+}
+
 pub fn update(cx: &Ctx) -> Frame {
     let (t, f, s, i, l) = (cx.t, cx.f, cx.state, cx.info, cx.state.lang);
     let mut c = long_page(cx);
@@ -2982,9 +3012,14 @@ fn skyward_online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
             tr!(l, "最新发布的版本为 {version}", "最新發佈的版本為 {version}", "The newest release is {version}"),
         ),
     };
-    let y = widgets::list(c, t, f, y, &[Row::new(&title).icon(GREEN, Icon::Install).subtitle(&detail).trail(Trail::None)]).bottom;
+    let mut y = widgets::list(c, t, f, y, &[Row::new(&title).icon(GREEN, Icon::Install).subtitle(&detail).trail(Trail::None)]).bottom;
     if !newest.newer || newest.build.is_none() {
         return y;
+    }
+    // What the release says of itself, under the version it is.
+    if let Some(body) = &newest.notes {
+        y = widgets::section(c, t, f, y + t.m.card_gap, l.pick(["更新日志", "更新日誌", "What's new"]));
+        y = release_notes(c, t, f, y, body);
     }
     match &s.skyward_job {
         Some(job) if job.outcome.is_none() => {

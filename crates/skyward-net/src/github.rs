@@ -19,6 +19,8 @@ pub struct Newest {
     pub newer: bool,
     /// Its zip for the phone; none when it has none.
     pub build: Option<Build>,
+    /// What it was published with, as GitHub gives it.
+    pub notes: Option<String>,
 }
 
 /// A phone's zip in a release, which holds Skyward's image for the phone.
@@ -50,6 +52,9 @@ impl Build {
 struct Release {
     tag_name: String,
     assets: Vec<Asset>,
+    /// The words the release was published with, in Markdown.
+    #[serde(default)]
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,7 +94,8 @@ pub fn newest(answer: &str, codename: &str, running: &str) -> Result<Newest> {
             Some(Build { sha256: sha256.to_lowercase(), name: a.name, url: a.url, link: a.browser_download_url, size: a.size })
         }
     };
-    Ok(Newest { version: version.to_string(), newer: newest > this, build })
+    let notes = release.body.filter(|body| !body.trim().is_empty());
+    Ok(Newest { version: version.to_string(), newer: newest > this, build, notes })
 }
 
 /// Ask GitHub for Skyward's newest release, and its zip for the phone

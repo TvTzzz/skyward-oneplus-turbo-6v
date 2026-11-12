@@ -11319,6 +11319,7 @@ mod tests {
 
     fn skyward_newest(newer: bool) -> Newest {
         Newest {
+            notes: None,
             version: "0.1.4".into(),
             newer,
             build: Some(Build {
