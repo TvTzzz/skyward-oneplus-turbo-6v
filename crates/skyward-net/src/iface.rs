@@ -89,7 +89,28 @@ pub fn set_up(interface: &str, up: bool) -> Result<()> {
         }
     }
     let doing = if up { format!("bring {interface} up") } else { format!("take {interface} down") };
-    ioctl(&fd, libc::SIOCSIFFLAGS as libc::c_int, (&mut r as *mut libc::ifreq).cast(), &doing)
+    // A driver still starting its interface, its firmware loading, answers
+    // EBUSY: it is tried again for a while rather than the WLAN being given
+    // up on the moment it was asked for.
+    let mut tries = 0;
+    loop {
+        let done = ioctl(&fd, libc::SIOCSIFFLAGS as libc::c_int, (&mut r as *mut libc::ifreq).cast(), &doing);
+        match done {
+            Ok(()) => return Ok(()),
+            Err(e) if busy(&e) && tries < 60 => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                tries += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `e` is the kernel saying the interface is busy for the moment.
+fn busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::EBUSY))
 }
 
 /// Give the interface `address` in a network of `mask`; what is sent to

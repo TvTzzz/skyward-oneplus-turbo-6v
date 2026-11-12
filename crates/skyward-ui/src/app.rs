@@ -2486,7 +2486,7 @@ const REPEAT_MS: u64 = 50;
 /// the two waits this long, or until it is let go, before it does what it
 /// does alone.
 /// How long the power key is held before the power menu shows.
-const POWER_MENU_MS: u64 = 3_000;
+const POWER_MENU_MS: u64 = 2_000;
 
 /// How long a lock left alone stays lit before the panel goes dark again,
 /// in milliseconds.
