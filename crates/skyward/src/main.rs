@@ -707,6 +707,11 @@ fn recovery() -> Result<()> {
         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
+        // A program that panics leaves its reason on the kernel log, which
+        // is the one place a recovery's own words outlive it.
+        std::panic::set_hook(Box::new(|info| {
+            let _ = skyward_sys::kmsg(&format!("skyward panicked: {info}"));
+        }));
         // Wireless debugging, where it was kept on, is asked for before adbd
         // starts: it reads the port as it comes up, and restarting it after
         // the port is asked for would drop the cable's connection for the

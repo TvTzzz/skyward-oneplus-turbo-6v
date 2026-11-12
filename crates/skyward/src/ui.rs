@@ -38,8 +38,7 @@ use skyward_ui::app::{
     App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
     FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
-    INSTALL_UNFINISHED, USB_DRIVE,
-};
+    INSTALL_UNFINISHED, USB_DRIVE, AvbPart, ModuleEntry};
 use skyward_ui::settings::Keeper;
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
@@ -445,6 +444,24 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
 }
 
 /// What a backup's manifest records, as the pages show it.
+/// Remove the module at `at` from the installed system's own folder, and
+/// from the pages' list of them.
+fn remove_module(app: &mut App, at: usize, now: u64) -> Result<()> {
+    let Some(module) = app.state.modules.get(at).cloned() else { return Ok(()) };
+    let dir = Path::new("/data/adb/modules").join(&module.id);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            skyward_sys::kmsg(&format!("{} removed", module.id))?;
+            app.report(&format!("{} removed", module.id), now);
+        }
+        Err(e) => app.report(&format!("{}: {e}", module.id), now),
+    }
+    let mut left = app.state.modules.clone();
+    left.retain(|m| m.id != module.id);
+    app.modules_listed(left);
+    Ok(())
+}
+
 fn held(m: &skyward_backup::Manifest) -> Held {
     Held {
         made: m.made,
@@ -1483,6 +1500,16 @@ pub fn run(
         }
         None => None,
     };
+    // The WLAN is brought up as the pages come up, where the settings say
+    // it is to be on from the start.
+    if app.state.wlan_at_start {
+        if let Some(w) = app.state.wlan.as_mut() {
+            w.power = WlanPower::Starting;
+        }
+        if let Some(worker) = &wlan {
+            worker.send(wlan::Command::On);
+        }
+    }
     let mut scanned_at = Instant::now();
     // Whether a kept network has been joined by itself this session.
     let mut auto_joined = false;
@@ -2766,6 +2793,164 @@ pub fn run(
                         wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
+                    // Verified boot's checks are two bits of a vbmeta
+                    // image's header flags, one image for the boot images and
+                    // one for each of the others.
+                    Effect::ReadAvb => {
+                        let slot = skyward_vab::current_slot().context("not an A/B phone")?.context("not an A/B phone")?;
+                        let suffix = slot.suffix();
+                        let mut parts = Vec::new();
+                        for base in ["vbmeta", "vbmeta_system", "vbmeta_vendor"] {
+                            let name = format!("{base}{suffix}");
+                            let path = Path::new(skyward_block::BY_NAME).join(&name);
+                            let Ok(mut file) = std::fs::File::open(&path) else { continue };
+                            use std::io::Read as _;
+                            let mut header = [0u8; 256];
+                            if file.read_exact(&mut header).is_err() {
+                                continue;
+                            }
+                            if &header[..4] != b"AVB0" {
+                                continue;
+                            }
+                            let algorithm = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+                            let flags = u32::from_be_bytes([header[120], header[121], header[122], header[123]]);
+                            // Bit 0 turns dm-verity off, bit 1 the bootloader's
+                            // checking of the partitions.
+                            parts.push(AvbPart { name, flags, algorithm, on: flags & 0b11 == 0 });
+                        }
+                        skyward_sys::kmsg(&format!("{} vbmeta image(s) read", parts.len()))?;
+                        app.avb_listed(parts);
+                    }
+                    Effect::SetAvb(off) => {
+                        let arg = match off {
+                            true => ["disable-verity", "disable-verification"],
+                            false => ["enable-verity", "enable-verification"],
+                        };
+                        let mut said = String::new();
+                        for one in arg {
+                            match std::process::Command::new("/system/bin/avbctl").arg(one).output() {
+                                Ok(out) if out.status.success() => {
+                                    said.push_str(String::from_utf8_lossy(&out.stdout).trim());
+                                    said.push(' ');
+                                }
+                                Ok(out) => {
+                                    said = format!("avbctl {one}: {}", String::from_utf8_lossy(&out.stderr).trim());
+                                    break;
+                                }
+                                Err(e) => {
+                                    said = format!("avbctl {one}: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        let said = said.trim().to_string();
+                        skyward_sys::kmsg(&said)?;
+                        app.report(&said, now);
+                        // The flags have changed under it: read them again.
+                        let slot = skyward_vab::current_slot().context("not an A/B phone")?.context("not an A/B phone")?;
+                        let suffix = slot.suffix();
+                        let mut parts = Vec::new();
+                        for base in ["vbmeta", "vbmeta_system", "vbmeta_vendor"] {
+                            let name = format!("{base}{suffix}");
+                            let path = Path::new(skyward_block::BY_NAME).join(&name);
+                            let Ok(mut file) = std::fs::File::open(&path) else { continue };
+                            use std::io::Read as _;
+                            let mut header = [0u8; 256];
+                            if file.read_exact(&mut header).is_err() || &header[..4] != b"AVB0" {
+                                continue;
+                            }
+                            let algorithm = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+                            let flags = u32::from_be_bytes([header[120], header[121], header[122], header[123]]);
+                            parts.push(AvbPart { name, flags, algorithm, on: flags & 0b11 == 0 });
+                        }
+                        app.avb_listed(parts);
+                    }
+                    // The modules the installed system keeps, under
+                    // /data/adb/modules: each folder's module.prop names it,
+                    // and a `disable` file in it stands for turned off.
+                    Effect::ReadModules => {
+                        let root = Path::new("/data/adb/modules");
+                        let mut found = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir(root) {
+                            for entry in entries.flatten() {
+                                let dir = entry.path();
+                                if !dir.is_dir() {
+                                    continue;
+                                }
+                                let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                let mut name = id.clone();
+                                let mut version = String::new();
+                                let mut description = String::new();
+                                if let Ok(text) = std::fs::read_to_string(dir.join("module.prop")) {
+                                    for line in text.lines() {
+                                        match line.split_once('=') {
+                                            Some(("name", value)) => name = value.trim().to_string(),
+                                            Some(("version", value)) => version = value.trim().to_string(),
+                                            Some(("description", value)) => description = value.trim().to_string(),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                let disabled = dir.join("disable").exists();
+                                found.push(ModuleEntry { id, name, version, description, disabled });
+                            }
+                        }
+                        found.sort_by(|a, b| a.id.cmp(&b.id));
+                        skyward_sys::kmsg(&format!("{} module(s) under /data/adb/modules", found.len()))?;
+                        app.modules_listed(found);
+                    }
+                    Effect::SetModule(at, disabled) => {
+                        let Some(module) = app.state.modules.get(at).cloned() else { continue };
+                        let path = Path::new("/data/adb/modules").join(&module.id).join("disable");
+                        let wrote = if disabled {
+                            std::fs::write(&path, b"").map_err(|e| format!("{e}"))
+                        } else {
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => Ok(()),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                Err(e) => Err(format!("{e}")),
+                            }
+                        };
+                        match wrote {
+                            Ok(()) => {
+                                let said = format!("{}: {}", module.id, if disabled { "off" } else { "on" });
+                                skyward_sys::kmsg(&said)?;
+                                app.report(&said, now);
+                            }
+                            Err(why) => {
+                                app.module_unchanged(at, module.disabled);
+                                app.report(&format!("{}: {why}", module.id), now);
+                            }
+                        }
+                    }
+                    Effect::RemoveModule(at) => remove_module(&mut app, at, now)?,
+                    // dm-verity and the bootloader's checking are the flags
+                    // avbctl flips in the slot's vbmeta image; the recovery
+                    // runs itself as that command, as a script would.
+                    Effect::AvbOff(_) => {
+                        // Both checks are flags in the same header, so both
+                        // are turned off, as the pages elsewhere do.
+                        let mut said = String::new();
+                        for arg in ["disable-verity", "disable-verification"] {
+                            match std::process::Command::new("/system/bin/avbctl").arg(arg).output() {
+                                Ok(out) if out.status.success() => {
+                                    said.push_str(String::from_utf8_lossy(&out.stdout).trim());
+                                    said.push(' ');
+                                }
+                                Ok(out) => {
+                                    said = format!("avbctl {arg} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                                    break;
+                                }
+                                Err(e) => {
+                                    said = format!("avbctl {arg}: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        let said = said.trim().to_string();
+                        skyward_sys::kmsg(&said)?;
+                        app.report(&said, now);
+                    }
                     // The partitions the phone has, for the pages that
                     // pick which of them a backup takes.
                     Effect::ListParts => {

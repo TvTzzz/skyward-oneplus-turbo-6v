@@ -78,6 +78,8 @@ pub struct Settings {
     pub no_battery_check: bool,
     /// The recovery starts straight into its pages, with no frame before.
     pub no_splash: bool,
+    /// The WLAN is brought up as the pages come up.
+    pub wlan_at_start: bool,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -162,6 +164,7 @@ impl Settings {
             auto_wlan: state.auto_wlan,
             no_battery_check: state.no_battery_check,
             no_splash: state.no_splash,
+            wlan_at_start: state.wlan_at_start,
             wlan: state
                 .saved_wlan
                 .iter()
@@ -232,6 +235,7 @@ impl Settings {
         state.auto_wlan = self.auto_wlan;
         state.no_battery_check = self.no_battery_check;
         state.no_splash = self.no_splash;
+        state.wlan_at_start = self.wlan_at_start;
         state.saved_wlan = self
             .wlan
             .iter()

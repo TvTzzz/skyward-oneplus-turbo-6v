@@ -82,6 +82,10 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::RestoreBackup => restore_backup(cx),
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
+        Screen::Modules => modules(cx),
+        Screen::Avb => avb(cx),
+        Screen::ModuleDelete(_) => module_delete(cx),
+        Screen::PowerMenu => power_menu(cx),
         Screen::Files => files(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
@@ -128,6 +132,9 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::Wipe => (["滑动以清除", "滑動以清除", "Slide to wipe"], true),
         Confirm::Flash => (["滑动以刷入", "滑動以刷入", "Slide to flash"], true),
         Confirm::Backup => (["滑动以备份", "滑動以備份", "Slide to back up"], false),
+        Confirm::Avb(true) => (["滑动以关闭校验", "滑動以關閉校驗", "Slide to turn the checks off"], true),
+        Confirm::Avb(false) => (["滑动以开启校验", "滑動以開啟校驗", "Slide to turn the checks on"], false),
+        Confirm::DeleteModule(_) => (["滑动以删除模块", "滑動以刪除模組", "Slide to remove the module"], true),
         Confirm::Restore => (["滑动以恢复", "滑動以還原", "Slide to restore"], true),
         Confirm::Slot => (["滑动以切换", "滑動以切換", "Slide to switch"], true),
         Confirm::FactoryReset => (["滑动以恢复出厂设置", "滑動以恢復原廠設定", "Slide to factory reset"], true),
@@ -389,6 +396,7 @@ pub fn settings(cx: &Ctx) -> Frame {
         Row::new(l.pick(["自动解密", "自動解密", "Open automatically"])).icon(SLATE, Icon::Backup).trail(Trail::Switch(s.auto_decrypt)),
         Row::new(l.pick(["忽略电量检测", "忽略電量偵測", "Ignore the charge"])).icon(SLATE, Icon::Battery).trail(Trail::Switch(s.no_battery_check)),
         Row::new(l.pick(["关闭启动动画", "關閉啟動動畫", "No start screen"])).icon(SLATE, Icon::Power).trail(Trail::Switch(s.no_splash)),
+        Row::new(l.pick(["启动时打开 WLAN", "啟動時開啟 WLAN", "WLAN at start"])).icon(SLATE, Icon::Wlan).trail(Trail::Switch(s.wlan_at_start)),
     ]);
     out.extend(hits(
         &general.rows,
@@ -400,6 +408,7 @@ pub fn settings(cx: &Ctx) -> Frame {
             Action::Toggle(Switch::AutoDecrypt),
             Action::Toggle(Switch::NoBatteryCheck),
             Action::Toggle(Switch::NoSplash),
+            Action::Toggle(Switch::WlanAtStart),
         ],
     ));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
@@ -613,7 +622,7 @@ pub fn mount(cx: &Ctx) -> Frame {
 }
 
 /// Who made the recovery, as the About page names them under its version.
-const AUTHOR: &str = "© 2026 Kirk Lin";
+const AUTHOR: &str = "© 2026 Kirk Lin & 若葉 睦";
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -2389,6 +2398,184 @@ const RESTORE_FAILED: Text = ["恢复失败", "還原失敗", "Restore failed"];
 const STOP: Text = ["停止", "停止", "Stop"];
 
 /// Tools for the experienced.
+/// The modules the installed system keeps under /data/adb/modules: each
+/// taken or left by a tap, and removed by a long one.
+/// Verified boot's two checks in the slot's vbmeta images: each image's
+/// flags, and the slide that turns them off or back on.
+pub fn avb(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(["AVB 校验", "AVB 校驗", "Verified boot"]);
+    if s.avb.is_empty() {
+        let why = match s.avb_read {
+            true => l.pick(["没有读到 vbmeta 分区。", "沒有讀到 vbmeta 分割區。", "No vbmeta image was read."]),
+            false => l.pick(["正在读取校验状态…", "正在讀取校驗狀態…", "Reading the checks…"]),
+        };
+        let y = widgets::footnote(&mut c, t, f, top, why);
+        return Frame::new(t, fit(c, t, y), out, title, top);
+    }
+    let on = s.avb.iter().any(|p| p.on);
+    let subs: Vec<String> = s
+        .avb
+        .iter()
+        .map(|p| {
+            let algo = match p.algorithm {
+                1 => "sha256_rsa2048",
+                2 => "sha256_rsa4096",
+                3 => "sha256_rsa8192",
+                _ => "—",
+            };
+            format!("flags 0x{:X} · {}", p.flags, algo)
+        })
+        .collect();
+    let rows: Vec<Row> = s
+        .avb
+        .iter()
+        .zip(&subs)
+        .map(|(p, sub)| {
+            Row::new(&p.name).subtitle(sub).trail(Trail::Text(if p.on {
+                l.pick(["开启", "開啟", "On"])
+            } else {
+                l.pick(["已关闭", "已關閉", "Off"])
+            }))
+        })
+        .collect();
+    let list = widgets::list(&mut c, t, f, top, &rows);
+    let mut y = widgets::footnote(&mut c, t, f, list.bottom, l.pick([
+        "本次启动：校验模式 enforcing。改动在下次启动生效。",
+        "本次啟動：校驗模式 enforcing。改動在下次啟動生效。",
+        "This start: the checks are enforcing. A change holds from the next one.",
+    ]));
+    y = widgets::footnote(&mut c, t, f, y, l.pick([
+        "AVB 让 bootloader 校验启动分区的签名，让内核逐块校验 system、vendor 的内容。",
+        "AVB 讓 bootloader 校驗啟動分割區的簽章，讓內核逐塊校驗 system、vendor 的內容。",
+        "AVB has the bootloader check the boot partitions' signatures, and the kernel check each block of system and vendor as it reads it.",
+    ]));
+    y = widgets::footnote(&mut c, t, f, y, l.pick([
+        "关掉之后：官方系统可能无法启动，官方 OTA 会失败，部分应用会读到这个状态。",
+        "關掉之後：官方系統可能無法啟動，官方 OTA 會失敗，部分應用會讀到這個狀態。",
+        "Turned off: the stock system may not start, official OTAs fail, and some apps read the state.",
+    ]));
+    let (label, danger) = confirm_label(Confirm::Avb(on), cx.state);
+    let share = if s.confirm_which == Some(Confirm::Avb(on)) { s.confirm } else { 0.0 };
+    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, share);
+    out.push(Hit { rect: track, action: Action::Confirm(Confirm::Avb(on)) });
+    Frame::new(t, fit(c, t, track.y + track.h), out, title, top)
+}
+
+/// Whether the module held long enough should go: a card on a dark page,
+/// with the two answers under it.
+/// What the power key offers when it is held: restarting the phone, or
+/// turning it off.
+pub fn power_menu(cx: &Ctx) -> Frame {
+    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+    let mut c = page(cx);
+    let top = t.m.content_top;
+    let rows = [
+        Row::new(l.pick(["关机", "關機", "Power off"])).icon(RED, Icon::Power),
+        Row::new(l.pick(["重启到系统", "重新啟動到系統", "Restart to the system"])).icon(BLUE, Icon::Restore),
+        Row::new(l.pick(["重启到恢复模式", "重新啟動到復原模式", "Restart to the recovery"])).icon(GREEN, Icon::Install),
+        Row::new(l.pick(["重启到 Fastbootd", "重新啟動到 Fastbootd", "Restart to fastbootd"])).icon(PURPLE, Icon::Terminal),
+        Row::new(l.pick(["重启到 Bootloader", "重新啟動到 Bootloader", "Restart to the bootloader"])).icon(SLATE, Icon::Usb),
+        Row::new(l.pick(["重启到 EDL", "重新啟動到 EDL", "Restart to EDL"])).icon(ORANGE, Icon::Layers),
+    ];
+    let list = widgets::list(&mut c, t, f, top, &rows);
+    let out = hits(&list.rows, &[
+        Action::RebootTo(Target::PowerOff),
+        Action::RebootTo(Target::System),
+        Action::RebootTo(Target::Recovery),
+        Action::RebootTo(Target::Fastboot),
+        Action::RebootTo(Target::Bootloader),
+        Action::RebootTo(Target::Edl),
+    ]);
+    Frame::new(t, c, out, l.pick(["电源菜单", "電源選單", "Power"]), top)
+}
+
+pub fn module_delete(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let (w, h) = (t.m.w, t.m.h);
+    let mut c = Canvas::filled(w, h, Rgba::rgb(0x0b, 0x0b, 0x0d));
+    let mut out = Vec::new();
+    let name = s
+        .delete_module
+        .and_then(|i| s.modules.get(i))
+        .map_or_else(String::new, |m| m.name.clone());
+    let cx_px = w as f32 / 2.0;
+    c.text_center(&f.heading, l.pick(["删除模块", "刪除模組", "Remove the module"]), cx_px, h as f32 * 0.36, (w as f32 * 0.06).round(), Rgba::rgb(0xf2, 0xf2, 0xf5));
+    c.text_center(&f.body, &name, cx_px, h as f32 * 0.36 + w as f32 * 0.10, (w as f32 * 0.045).round(), Rgba::rgb(0xc8, 0xc8, 0xd0));
+    c.text_center(
+        &f.body,
+        l.pick(["删除后无法恢复", "刪除後無法復原", "It can't be brought back"]),
+        cx_px,
+        h as f32 * 0.36 + w as f32 * 0.16,
+        (w as f32 * 0.036).round(),
+        Rgba::rgb(0x8a, 0x8a, 0x92),
+    );
+    let y = h as f32 * 0.58;
+    let rows = [
+        Row::new(l.pick(["删除", "刪除", "Remove"])).tint(t.pal.danger),
+        Row::new(l.pick(["取消", "取消", "Cancel"])),
+    ];
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    out.extend(hits(&list.rows, &[Action::DeleteModuleNow, Action::CancelModuleDelete]));
+    Frame::new(t, c, out, l.pick(["删除模块", "刪除模組", "Remove the module"]), 0.0)
+}
+
+pub fn modules(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    // As tall as the modules it lists, as the pages that pick partitions
+    // are: a phone with many modules has more than three screens of them.
+    // A row with a subtitle under its name is taller than the bare row the
+    // metric names, so the subtitle's line is counted with it.
+    let rows_n = s.modules.len().max(4) as f32;
+    // A subtitle may wrap to two lines, so two of its lines are counted.
+    let each = t.m.row_h + t.m.sub_px * 2.0 + t.m.row_pad_v * 4.0 + t.m.dp(16.0);
+    let tall = (t.m.content_top + rows_n * each + t.m.margin * 12.0).ceil() as u32;
+    let mut c = sheet(cx, tall.max(t.m.h * 3), t.pal.bg);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(MODULES);
+    if s.modules.is_empty() {
+        let why = match s.modules_read {
+            true => l.pick([
+                "没有找到模块。模块放在 /data/adb/modules 下，需要先完成「解密」。",
+                "沒有找到模組。模組放在 /data/adb/modules 下，需要先完成「解密」。",
+                "No modules found. They live under /data/adb/modules, and the data partition has to be decrypted first.",
+            ]),
+            false => l.pick(["正在读取模块…", "正在讀取模組…", "Reading the modules…"]),
+        };
+        let y = widgets::footnote(&mut c, t, f, top, why);
+        return Frame::new(t, fit(c, t, y), out, title, top);
+    }
+    let y = widgets::section_first(&mut c, t, f, top, l.pick(["模块", "模組", "Modules"]));
+    let subs: Vec<String> = s
+        .modules
+        .iter()
+        .map(|m| match m.version.is_empty() {
+            true => m.description.clone(),
+            false => format!("{} · {}", m.version, m.description),
+        })
+        .collect();
+    let rows: Vec<Row> = s
+        .modules
+        .iter()
+        .zip(&subs)
+        .map(|(m, sub)| Row::new(&m.name).subtitle(sub).trail(Trail::Check(!m.disabled)))
+        .collect();
+    let list = widgets::list(&mut c, t, f, y, &rows);
+    let picks: Vec<Action> = (0..s.modules.len()).map(Action::ToggleModule).collect();
+    out.extend(hits(&list.rows, &picks));
+    let note = l.pick([
+        "点一下开关模块，长按删除。关掉的模块下次开机不会加载。",
+        "點一下開關模組，長按刪除。關掉的模組下次開機不會載入。",
+        "Tap one to turn it off or on; hold it to remove it. A module turned off is not loaded at the next start.",
+    ]);
+    let y = widgets::footnote(&mut c, t, f, list.bottom, note);
+    Frame::new(t, fit(c, t, y), out, title, top)
+}
+
 pub fn advanced(cx: &Ctx) -> Frame {
     let (t, f, l) = (cx.t, cx.f, cx.state.lang);
     let mut c = page(cx);
@@ -2396,6 +2583,12 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let tools = widgets::list(&mut c, t, f, top, &[
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
         Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal),
+        Row::new(l.pick(AVB)).icon(ORANGE, Icon::Shield).trail(Trail::Value(match (cx.state.avb_read, cx.state.avb.iter().any(|p| p.on)) {
+            (false, _) => "—",
+            (true, true) => l.pick(["开启", "開啟", "On"]),
+            (true, false) => l.pick(["已关闭", "已關閉", "Off"]),
+        })),
+        Row::new(l.pick(MODULES)).icon(GREEN, Icon::Layers),
         Row::new(l.pick(RELABEL)).icon(PURPLE, Icon::Shield),
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
@@ -2404,6 +2597,8 @@ pub fn advanced(cx: &Ctx) -> Frame {
     let out = hits(&tools.rows, &[
         Action::Open(Screen::Files),
         Action::Open(Screen::Terminal),
+        Action::Open(Screen::Avb),
+        Action::Open(Screen::Modules),
         Action::Open(Screen::Relabel),
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
@@ -2412,6 +2607,8 @@ pub fn advanced(cx: &Ctx) -> Frame {
     Frame::new(t, c, out, l.pick(ADVANCED), top)
 }
 
+const AVB: Text = ["AVB 校验", "AVB 校驗", "Verified boot"];
+const MODULES: Text = ["模块管理", "模組管理", "Modules"];
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
 const FILESYSTEMS: Text = ["文件系统", "檔案系統", "Filesystems"];
 const STOPPED: Text = ["已停止", "已停止", "Stopped"];

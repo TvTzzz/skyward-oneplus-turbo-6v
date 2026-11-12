@@ -54,6 +54,14 @@ pub enum Screen {
     Refresh,
     /// Which partitions a backup takes besides the groups.
     BackupParts,
+    /// The modules the installed system keeps, to turn off or remove.
+    Modules,
+    /// Verified boot's checks in the slot's vbmeta images.
+    Avb,
+    /// Asking whether the module at this place should be removed.
+    ModuleDelete(usize),
+    /// What the power key offers when it is held: restarting, and going off.
+    PowerMenu,
     /// The networks kept, with their passwords, and whether the recovery
     /// joins them by itself.
     SavedWlan,
@@ -576,6 +584,8 @@ pub enum Switch {
     NoBatteryCheck,
     /// Start with no frame before the pages.
     NoSplash,
+    /// Bring the WLAN up as the pages come up.
+    WlanAtStart,
     /// The recovery opens the owner's files by itself.
     AutoDecrypt,
 }
@@ -587,6 +597,32 @@ pub const BACKUP_PARTS: [Text; 4] = [
     ["data 分区", "data 分割區", "data partition"],
     ["基带与 EFS", "基頻與 EFS", "Modem and EFS"],
 ];
+
+/// A vbmeta partition of the slot the phone runs from: the flags its header
+/// holds, and the signature algorithm it names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AvbPart {
+    pub name: String,
+    pub flags: u32,
+    /// AVB's number for the signature's algorithm: 0 none, 1 sha256_rsa2048,
+    /// 2 sha256_rsa4096, 3 sha256_rsa8192.
+    pub algorithm: u32,
+    /// Neither check is turned off in its flags.
+    pub on: bool,
+}
+
+/// A module the phone's own system keeps under /data/adb/modules: what its
+/// module.prop says of it, and whether it is turned off.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleEntry {
+    /// The folder it lives in, which is how it is known.
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// A `disable` file stands in its folder.
+    pub disabled: bool,
+}
 
 /// A backup found in a place's Skyward/backups folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -884,6 +920,10 @@ pub enum Confirm {
     Slot,
     /// Erase all user data, as the system offered when it could not start.
     FactoryReset,
+    /// Turn verified boot's checks off, or back on.
+    Avb(bool),
+    /// Remove the module at this place.
+    DeleteModule(usize),
     /// Delete the entry the file page shows.
     DeleteEntry,
     /// Delete the backup the restore page shows.
@@ -1239,6 +1279,15 @@ pub enum Action {
     /// Take the custom partitions, or leave them: the row that opens them
     /// shows while they are taken.
     ShowCustomParts,
+    /// Turn dm-verity off (`true`) or the bootloader's checking of the
+    /// partitions (`false`).
+    AvbOff(bool),
+    /// Turn the module at this place in the list off, or back on.
+    ToggleModule(usize),
+    /// Remove the module the page asks about.
+    DeleteModuleNow,
+    /// Leave it as it is.
+    CancelModuleDelete,
     /// Take or leave the partition at this place in the phone's list.
     CustomPart(usize),
     /// Take every partition the phone has, or leave them all.
@@ -1664,6 +1713,8 @@ pub struct State {
     pub no_battery_check: bool,
     /// The recovery starts straight into its pages, with no frame before.
     pub no_splash: bool,
+    /// The WLAN is brought up as the pages come up.
+    pub wlan_at_start: bool,
     /// The recovery opens the owner's files by itself with the credential it
     /// kept, rather than asking for it at each start.
     pub auto_decrypt: bool,
@@ -1721,6 +1772,17 @@ pub struct State {
     /// The custom partitions are taken: the row that opens them shows under
     /// their own.
     pub show_custom: bool,
+    /// The modules the installed system keeps, as their folders say.
+    pub modules: Vec<ModuleEntry>,
+    /// Their folders are being read.
+    pub modules_read: bool,
+    /// The module held long enough to be removed, waiting for the slide
+    /// that says so.
+    pub delete_module: Option<usize>,
+    /// The vbmeta partitions of the slot the phone runs from.
+    pub avb: Vec<AvbPart>,
+    /// They have been read.
+    pub avb_read: bool,
     /// The backup the restore page shows, as it was found, and which of its
     /// parts to restore.
     pub restore: Option<(BackupEntry, [bool; 4])>,
@@ -1859,6 +1921,7 @@ impl Default for State {
             auto_wlan: true,
             no_battery_check: false,
             no_splash: false,
+            wlan_at_start: false,
             auto_decrypt: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
@@ -1886,6 +1949,11 @@ impl Default for State {
             extra_backup: Vec::new(),
             extra_restore: Vec::new(),
             show_custom: false,
+            modules: Vec::new(),
+            modules_read: false,
+            delete_module: None,
+            avb: Vec::new(),
+            avb_read: false,
             restore: None,
             backup_job: None,
             logs: [true, true],
@@ -2070,6 +2138,18 @@ pub enum Effect {
     Credential(Option<Vec<u8>>),
     /// List the partitions the phone has, for the pages that pick them.
     ListParts,
+    /// Turn dm-verity off, or the bootloader's checking of the partitions.
+    AvbOff(bool),
+    /// Read the modules the installed system keeps.
+    ReadModules,
+    /// Read the flags of the slot's vbmeta images.
+    ReadAvb,
+    /// Turn both checks off (`true`) or back on in the slot's vbmeta images.
+    SetAvb(bool),
+    /// Turn the module at this place off, or back on.
+    SetModule(usize, bool),
+    /// Remove the module at this place.
+    RemoveModule(usize),
     /// The owner agreed to keep the credential: the pages ask for it once
     /// more, to be sure it opens their files.
     EnableAutoDecrypt,
@@ -2283,6 +2363,10 @@ enum Press {
     /// comes up; held long enough over an entry of the file manager, it
     /// opens what can be done with the entry, as a long press does.
     Power { spot: Spot, at: u64 },
+    /// The power key on a page with no control lit, from `at`: let go before
+    /// it has been held long enough, it turns the screen off; held longer,
+    /// the power menu comes up.
+    PowerHold { at: u64 },
     /// The power key on a swipe-to-confirm control, whose knob slides along
     /// its track at `track` from `at` while the key is held; let go once
     /// it has slid far enough, the control confirms.
@@ -2401,6 +2485,9 @@ const REPEAT_MS: u64 = 50;
 /// take a screenshot, as the system's key combination does; the first of
 /// the two waits this long, or until it is let go, before it does what it
 /// does alone.
+/// How long the power key is held before the power menu shows.
+const POWER_MENU_MS: u64 = 3_000;
+
 /// How long a lock left alone stays lit before the panel goes dark again,
 /// in milliseconds.
 const LOCK_OFF: u64 = 7_000;
@@ -3053,6 +3140,28 @@ impl App {
                 fx.extend(self.held_entry(i));
             }
         }
+        // The power key held, on a page rather than a control, puts the
+        // power menu up: what the phone's own system offers on it.
+        if let Some((Key::Power, Press::PowerHold { at })) = self.button {
+            if now >= at + POWER_MENU_MS && !self.locked {
+                self.button = Some((Key::Power, Press::Spent));
+                self.open(Screen::PowerMenu);
+                self.refresh();
+            }
+        }
+        // A module held long enough is removed, as a file held long enough
+        // shows what can be done with it.
+        if let Drag::Press { action: Some(Action::ToggleModule(i)), at, .. } = self.drag {
+            if now >= at + LONG_PRESS_MS {
+                self.drag = Drag::Held;
+                self.state.delete_module = Some(i);
+                self.open(Screen::ModuleDelete(i));
+                self.refresh();
+                if self.state.vibrate {
+                    fx.push(Effect::Haptic);
+                }
+            }
+        }
         if let Some((key, Press::Power { spot: Spot { stop: Stop::Hit(Action::OpenEntry(i)), .. }, at })) = self.button {
             if now >= at + LONG_PRESS_MS {
                 self.button = Some((key, Press::Spent));
@@ -3468,6 +3577,28 @@ impl App {
 
     /// Fastboot has stopped and the recovery is up: its pages start again
     /// from the home page, which nothing can go back from to fastboot.
+    /// The flags of the slot's vbmeta images, as their headers give them.
+    pub fn avb_listed(&mut self, parts: Vec<AvbPart>) {
+        self.state.avb = parts;
+        self.state.avb_read = true;
+        self.refresh();
+    }
+
+    /// The modules the installed system keeps, as their folders say.
+    pub fn modules_listed(&mut self, modules: Vec<ModuleEntry>) {
+        self.state.modules = modules;
+        self.state.modules_read = true;
+        self.refresh();
+    }
+
+    /// A module's mark is put back as it was, when writing it went wrong.
+    pub fn module_unchanged(&mut self, at: usize, disabled: bool) {
+        if let Some(m) = self.state.modules.get_mut(at) {
+            m.disabled = disabled;
+        }
+        self.refresh();
+    }
+
     /// The partitions the phone has, by name, as the pages that pick them
     /// show them.
     pub fn parts_listed(&mut self, names: Vec<String>) {
@@ -5311,6 +5442,11 @@ impl App {
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
             Screen::Systems => vec![Effect::ReadSystems],
+            Screen::Modules => vec![Effect::ReadModules],
+            Screen::Avb => vec![Effect::ReadAvb],
+            // The pages that ask for it show the checks' state on their own
+            // rows, so it is read as they open.
+            Screen::Advanced => vec![Effect::ReadAvb],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
             Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
@@ -5446,6 +5582,7 @@ impl App {
                     Switch::AutoWlan => &mut self.state.auto_wlan,
                     Switch::NoBatteryCheck => &mut self.state.no_battery_check,
                     Switch::NoSplash => &mut self.state.no_splash,
+                    Switch::WlanAtStart => &mut self.state.wlan_at_start,
                     Switch::AutoDecrypt => unreachable!("the automatic decryption switch is turned above"),
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
@@ -5664,6 +5801,27 @@ impl App {
             }
             // The row that opens the custom partitions shows once they are
             // taken, which is what its mark says.
+            // The checks are turned off in the vbmeta image of the slot the
+            // phone runs from, as avbctl does for an install script.
+            Action::AvbOff(verity) => return vec![Effect::AvbOff(verity)],
+            Action::DeleteModuleNow => {
+                if let Some(at) = self.state.delete_module.take() {
+                    self.back(now);
+                    return vec![Effect::RemoveModule(at)];
+                }
+            }
+            Action::CancelModuleDelete => {
+                self.state.delete_module = None;
+                self.back(now);
+            }
+            Action::ToggleModule(i) => {
+                let disabled = self.state.modules.get(i).is_some_and(|m| m.disabled);
+                if let Some(m) = self.state.modules.get_mut(i) {
+                    m.disabled = !disabled;
+                }
+                self.refresh();
+                return vec![Effect::SetModule(i, !disabled)];
+            }
             Action::ShowCustomParts => {
                 self.state.show_custom = !self.state.show_custom;
                 if !self.state.show_custom {
@@ -6322,7 +6480,7 @@ impl App {
                 }
                 Touch::Move(_, y) => {
                     let from = self.unlock_from.unwrap_or(y);
-                    self.unlock_share = ((from - y) / (height * 0.45)).clamp(0.0, 1.0);
+                    self.unlock_share = ((from - y) / (height * 0.22)).clamp(0.0, 1.0);
                     self.stir(now);
                     self.dirty = true;
                 }
@@ -6741,7 +6899,7 @@ impl App {
 
     /// What a button that went down `at` does on its own, `now`: a key
     /// held is timed from when it went down, the screen goes off from now.
-    fn key_down(&mut self, key: Key, at: u64, now: u64) -> Vec<Effect> {
+    fn key_down(&mut self, key: Key, at: u64, _now: u64) -> Vec<Effect> {
         match key {
             Key::Back => {
                 self.button = Some((key, Press::Spent));
@@ -6767,12 +6925,10 @@ impl App {
                         self.button = Some((key, Press::Slide { which, track: rect, at }))
                     }
                     Some(spot) => self.button = Some((key, Press::Power { spot, at })),
-                    // Turning the screen off, the key ticks the motor.
-                    None => {
-                        self.button = Some((key, Press::Spent));
-                        self.sleep(now);
-                        return vec![Effect::Ticks];
-                    }
+                    // With no control lit it may be a short press, which
+                    // turns the screen off, or a long one, which asks for
+                    // the power menu: let go first, and see.
+                    None => self.button = Some((key, Press::PowerHold { at })),
                 }
                 Vec::new()
             }
@@ -6805,6 +6961,10 @@ impl App {
                     self.say(self.state.lang.pick(["请按住电源键", "請按住電源鍵", "Hold the power key"]), now);
                 }
             }
+            Press::PowerHold { .. } => {
+                self.sleep(now);
+                fx.push(Effect::Ticks);
+            }
             Press::Volume { .. } | Press::Spent => {}
         }
         fx
@@ -6833,6 +6993,11 @@ impl App {
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
+            Confirm::Avb(off) => fx.push(Effect::SetAvb(off)),
+            Confirm::DeleteModule(at) => {
+                self.state.delete_module = None;
+                fx.push(Effect::RemoveModule(at));
+            }
             Confirm::Wipe => {
                 let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();
                 match chosen.is_empty() {
