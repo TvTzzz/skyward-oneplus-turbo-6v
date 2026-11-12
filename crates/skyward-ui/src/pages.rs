@@ -3300,7 +3300,13 @@ fn skyward_online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
 pub fn wlan(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let w = s.wlan.as_ref().expect("the WLAN page shows on a phone whose WLAN is brought up");
-    let mut c = long_page(cx);
+    // As tall as the networks it may list: a scan that finds many of them
+    // makes a page longer than three screens, and a row drawn past the
+    // canvas is a row the compositor cannot crop back.
+    let rows_n = (w.networks.len() + s.saved_wlan.len() + 8) as f32;
+    let each = t.m.row_h + t.m.sub_px * 2.0 + t.m.row_pad_v * 4.0 + t.m.dp(16.0);
+    let tall = (t.m.content_top + rows_n * each + t.m.margin * 12.0).ceil() as u32;
+    let mut c = sheet(cx, tall.max(t.m.h * 3), t.pal.bg);
     let mut out = Vec::new();
     let top = t.m.content_top;
     let on = !matches!(w.power, Power::Off | Power::Failed(_));

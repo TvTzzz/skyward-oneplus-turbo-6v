@@ -4704,12 +4704,20 @@ impl App {
         if let (Some(press), None) = (self.row_press.filter(|p| now >= p.rise), &self.row_art) {
             let page = &self.frame.as_ref().expect("rendered above").canvas;
             let (x, y, w, h) = row_part(press.rect, page);
-            let pressed = t.pressed();
-            let band = Band { rows: (y, y + h), cols: (x, x + w) };
-            let cx = Ctx { t: &pressed, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
-            let down = pages::render(screen, &cx).canvas;
-            assert_eq!((down.w, down.h), (page.w, page.h), "a page held down is laid out as it was");
-            self.row_art = Some((page.crop(x, y, w, h), down.crop(x, y, w, h)));
+            // Only the rows this page holds are drawn: a row that scrolled
+            // out of the drawn band is nothing to draw again, and cropping
+            // past it is a page laid out taller than its canvas.
+            let held = page.held();
+            let (top, end) = (y.max(held.start), (y + h).min(held.end));
+            if end > top {
+                let (x, y, h) = (x, top, end - top);
+                let pressed = t.pressed();
+                let band = Band { rows: (y, y + h), cols: (x, x + w) };
+                let cx = Ctx { t: &pressed, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
+                let down = pages::render(screen, &cx).canvas;
+                assert_eq!((down.w, down.h), (page.w, page.h), "a page held down is laid out as it was");
+                self.row_art = Some((page.crop(x, y, w, h), down.crop(x, y, w, h)));
+            }
         }
         let view = View {
             scroll,
@@ -6015,7 +6023,19 @@ impl App {
                     Security::Enterprise => {
                         self.say(l.pick(["暂不支持需要账号登录的网络", "尚不支援需要帳號登入的網路", "Networks that need an account sign-in aren't supported"]), now)
                     }
-                    s if s.password() => self.ask_password(network),
+                    // A password kept from an earlier join is used again, so
+                    // the network opens without being asked for it anew.
+                    s if s.password() => match self.saved_wlan(&network.name) {
+                        Some(saved) => {
+                            return vec![Effect::JoinWlan {
+                                ssid: network.ssid,
+                                name: network.name,
+                                security: network.security,
+                                password: Secret(saved.password.clone()),
+                            }]
+                        }
+                        None => self.ask_password(network),
+                    },
                     _ => {
                         return vec![Effect::JoinWlan {
                             ssid: network.ssid,
