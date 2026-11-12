@@ -286,6 +286,8 @@ pub fn home(cx: &Ctx) -> Frame {
         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
         opens.push(Action::Open(Screen::Wlan));
     }
+    rows.push(Row::new(l.pick(["闪光灯", "閃光燈", "Flashlight"])).icon(ORANGE, Icon::Power).trail(Trail::Switch(cx.state.torch)));
+    opens.push(Action::Toggle(Switch::Torch));
     let starts = systems_value(cx);
     if cx.state.offers(Screen::Systems) {
         let row = Row::new(l.pick(DUAL_BOOT)).icon(PURPLE, Icon::Systems);

@@ -586,6 +586,8 @@ pub enum Switch {
     NoSplash,
     /// Bring the WLAN up as the pages come up.
     WlanAtStart,
+    /// Light the flashlight, or put it out.
+    Torch,
     /// The recovery opens the owner's files by itself.
     AutoDecrypt,
 }
@@ -1715,6 +1717,8 @@ pub struct State {
     pub no_splash: bool,
     /// The WLAN is brought up as the pages come up.
     pub wlan_at_start: bool,
+    /// The flashlight is lit.
+    pub torch: bool,
     /// The recovery opens the owner's files by itself with the credential it
     /// kept, rather than asking for it at each start.
     pub auto_decrypt: bool,
@@ -1922,6 +1926,7 @@ impl Default for State {
             no_battery_check: false,
             no_splash: false,
             wlan_at_start: false,
+            torch: false,
             auto_decrypt: false,
             reboot: 0,
             wipe: [false; WIPES.len()],
@@ -2140,6 +2145,8 @@ pub enum Effect {
     ListParts,
     /// Turn dm-verity off, or the bootloader's checking of the partitions.
     AvbOff(bool),
+    /// Light the flashlight, or put it out.
+    Torch(bool),
     /// Read the modules the installed system keeps.
     ReadModules,
     /// Read the flags of the slot's vbmeta images.
@@ -5591,12 +5598,16 @@ impl App {
                     Switch::NoBatteryCheck => &mut self.state.no_battery_check,
                     Switch::NoSplash => &mut self.state.no_splash,
                     Switch::WlanAtStart => &mut self.state.wlan_at_start,
+                    Switch::Torch => &mut self.state.torch,
                     Switch::AutoDecrypt => unreachable!("the automatic decryption switch is turned above"),
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
                 self.refresh();
+                if switch == Switch::Torch {
+                    return vec![Effect::Torch(now_on)];
+                }
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
                 }

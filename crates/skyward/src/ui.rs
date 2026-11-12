@@ -2793,6 +2793,22 @@ pub fn run(
                         wlan_worker(&wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
                     }
                     Effect::LeaveWlan => wlan_worker(&wlan)?.send(wlan::Command::Leave),
+                    // The flashlight is a torch LED and the switch that feeds
+                    // it: the brightness goes in first, then the switch, and
+                    // it is lit at a tenth of what the LED takes at most.
+                    Effect::Torch(on) => {
+                        let torch = Path::new("/sys/class/leds/led:torch_2/brightness");
+                        let switch = Path::new("/sys/class/leds/led:switch_2/brightness");
+                        let wrote = if on {
+                            std::fs::write(torch, "100").and_then(|()| std::fs::write(switch, "1"))
+                        } else {
+                            std::fs::write(switch, "0").and_then(|()| std::fs::write(torch, "0"))
+                        };
+                        match wrote {
+                            Ok(()) => skyward_sys::kmsg(&format!("flashlight {}", if on { "on" } else { "off" }))?,
+                            Err(e) => app.report(&format!("flashlight: {e}"), now),
+                        }
+                    }
                     // Verified boot's checks are two bits of a vbmeta
                     // image's header flags, one image for the boot images and
                     // one for each of the others.
